@@ -471,6 +471,50 @@ pub struct QueryAuditEntry {
 }
 
 // ---------------------------------------------------------------------------
+// §4.4 — Consistency-enforcement surface types (derived from §4.4)
+//
+// These are the §4.4.4 consistency-report value and the §4.4.3 re-sync surfaces.
+// The Implementer must NOT add fields to the frozen §4.1 `Node`/`Edge`; the §4.4
+// re-sync operations update the reference node's `value` (the embed **snapshot**,
+// §4.2.2) and the reference edge's `state` in place under the shard write lock.
+// ---------------------------------------------------------------------------
+
+/// One row of the §4.4.4 consistency report: `{documentId, nodeId, kind: 'link'|
+/// 'embed'|'crosslink', state: 'BROKEN'|'STALE'|'FRESH'|'RESOLVED', target,
+/// crossWiki}` for **every reference edge in the wiki**.
+///
+/// - `document_id` — the **referencing** (source) document of the reference edge.
+/// - `node_id` — the reference **node** id (the edge's source node) inside that
+///   document.
+/// - `kind` — `EdgeKind::Link` | `EdgeKind::Embed` | `EdgeKind::Crosslink`.
+/// - `state` — the reference edge's `ReferenceState` (§4.4.2).
+/// - `target` — the reference edge's target `(documentId, nodeId)`.
+/// - `cross_wiki` — whether the target lives in another wiki.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsistencyReferenceReport {
+    pub document_id: DocumentId,
+    pub node_id: NodeId,
+    pub kind: EdgeKind,
+    pub state: ReferenceState,
+    pub target: (DocumentId, NodeId),
+    pub cross_wiki: bool,
+}
+
+/// The §4.4.3 community staleness surface. A `community`'s derived summary is a
+/// **projection** of its members (§4.2.8.3): a member node/edge change marks the
+/// community `STALE` until `re_derive_community` clears it (§4.4.1a / §4.4.3).
+/// Because §4.4.4's report shape pins reference kinds only (`kind: 'link'|'embed'|
+/// 'crosslink'`), community staleness — the §4.4.1a third propagator — is surfaced
+/// through this accessor (TestWriter resolution of the §4.4.1a-vs-§4.4.4 tension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CommunityState {
+    /// The community's summary reflects its current members.
+    Fresh,
+    /// A member node/edge changed; the summary is stale until re-derived.
+    Stale,
+}
+
+// ---------------------------------------------------------------------------
 // §4.1.3 request / response shapes
 // ---------------------------------------------------------------------------
 
@@ -930,6 +974,52 @@ pub trait RagStore: Send + Sync {
     fn get_query_audit_log(
         &self,
     ) -> impl Future<Output = Result<Vec<QueryAuditEntry>, StoreError>> + Send;
+
+    // -----------------------------------------------------------------------
+    // §4.4 — Consistency enforcement surface (added by the §4.4 TestWriter,
+    // RED-first). These bodies are COMPILING STUBS — they must NOT implement real
+    // staleness logic.
+    // -----------------------------------------------------------------------
+
+    /// `getConsistencyReport(wikiId) → ConsistencyReferenceReport[]` (§4.4.4).
+    /// Returns one entry (`{documentId, nodeId, kind, state, target, crossWiki}`)
+    /// for **every reference edge** (`link`/`embed`/`crosslink`) in the wiki. The
+    /// report surfaces the reference propagator (§4.4.1a). Fail-states:
+    /// `WikiNotFound` (unknown wiki).
+    fn get_consistency_report(
+        &self,
+        wiki_id: &WikiId,
+    ) -> impl Future<Output = Result<Vec<ConsistencyReferenceReport>, StoreError>> + Send;
+
+    /// §4.4.3 re-sync of a single `STALE` embed: updates the reference node's
+    /// snapshot (its `value`) to the target's canonical value, flips the embed
+    /// edge's state to `FRESH`, and bumps the referencing document's `revision`.
+    /// Failures: `DocumentNotFound` (unknown doc); `ValidationError` (the node is
+    /// not a reference/embed node, or a non-embed kind).
+    fn re_sync_embed(
+        &self,
+        document_id: &DocumentId,
+        node_id: &NodeId,
+    ) -> impl Future<Output = Result<Document, StoreError>> + Send;
+
+    /// §4.4.3 re-derive of a `STALE` community. Automatic summary derivation is
+    /// PARKED (F4), so re-derive = clear the `STALE` flag (refresh the community
+    /// back to `Fresh`); the manual summary is authoritative and never
+    /// regenerated (§4.2.8.4). Failures: `CommunityNotFound` (unknown community).
+    fn re_derive_community(
+        &self,
+        community_id: &CommunityId,
+    ) -> impl Future<Output = Result<Community, StoreError>> + Send;
+
+    /// §4.4.3/§4.4.1a community-staleness accessor — the §4.4.1a third propagator
+    /// surfaced independently of the reference-typed report (whose §4.4.4 shape
+    /// pins `link`/`embed`/`crosslink` only). A community incorporating a changed
+    /// fact/reference reports `STALE` until re-derived. Failures:
+    /// `CommunityNotFound` (unknown community).
+    fn community_state(
+        &self,
+        community_id: &CommunityId,
+    ) -> impl Future<Output = Result<CommunityState, StoreError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1086,14 @@ pub struct Store {
     /// Declared communities, keyed by `communityId` (§4.2.8.2); the authoritative
     /// `summary` that the manual override must never be overwritten by (§4.2.8.4).
     communities: RwLock<HashMap<CommunityId, Community>>,
+    /// The authoritative community-staleness flag (§4.4.1a/§4.4.3). A community's
+    /// derived summary is a **projection** of its members: a member node/edge
+    /// change or a change to a fact the community incorporates marks it `STALE`
+    /// until `re_derive_community` returns it to `Fresh`. Defaults to `Fresh`
+    /// (via the reading accessor's `unwrap_or`) so communities declared before
+    /// this map holds a row — and the manual-override rule (§4.2.8.4) — read
+    /// `Fresh` until a triggering mutation marks them stale.
+    community_states: RwLock<HashMap<CommunityId, CommunityState>>,
     /// Declared facts, keyed by `wikiId` then by the wiki-unique `factKey`
     /// (§4.3.1). Carries each fact's `citations` + `updatedAt` — the properties
     /// the frozen fact `Node` cannot store.
@@ -1051,6 +1149,7 @@ impl Store {
             journal: RwLock::new(Vec::new()),
             epoch: AtomicU64::new(0),
             communities: RwLock::new(HashMap::new()),
+            community_states: RwLock::new(HashMap::new()),
             fact_store: RwLock::new(HashMap::new()),
             triple_store: RwLock::new(Vec::new()),
             state_annotations: RwLock::new(HashMap::new()),
@@ -1275,6 +1374,343 @@ impl Store {
         let guard = self.shard_for(document_id).read().unwrap();
         guard.docs.get(document_id).map(|d| d.state)
     }
+
+    /// Mark every declared community whose member set intersects `locs` as
+    /// `STALE` (§4.4.1a / §4.4.3). Called by the fact-update and member-change
+    /// propagators. Takes only the `communities`/`community_states` sidecars.
+    fn mark_communities_stale(&self, locs: &[(DocumentId, NodeId)]) {
+        let ids: Vec<CommunityId> = {
+            let comms = self.communities.read().unwrap();
+            comms
+                .values()
+                .filter(|c| c.members.iter().any(|m| locs.contains(m)))
+                .map(|c| c.community_id.clone())
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let mut states = self.community_states.write().unwrap();
+        for id in ids {
+            states.insert(id, CommunityState::Stale);
+        }
+    }
+
+    /// Is a reference edge a **snapshot embed** — an `embed`, or a `crosslink`
+    /// whose source reference node carries a copied snapshot `value` (§4.2.2)?
+    /// A pure `link` (or a `crosslink` with no copied value) is a live
+    /// reference resolved at render time, never a snapshot. Drives which
+    /// references staleness propagation marks `STALE` as opposed to `BROKEN`/
+    /// staying resolved.
+    fn is_snapshot_embed(&self, edge: &Edge, doc: &Document) -> bool {
+        match edge.kind {
+            EdgeKind::Embed => true,
+            EdgeKind::Link => false,
+            EdgeKind::Crosslink => doc
+                .graph
+                .nodes
+                .iter()
+                .any(|n| n.node_id == edge.source.1 && n.value.is_some()),
+            _ => false,
+        }
+    }
+
+    /// Snapshot every committed fact's canonical location → value. Read-only
+    /// (§4.3.1 canonical source). Taken **once** per derivation pass so the
+    /// report/derivation never holds `fact_store.read()` across shard reads and
+    /// never re-locks it per edge — deadlock-free against the fact-commit paths.
+    fn fact_canonical_snapshot(&self) -> HashMap<(DocumentId, NodeId), String> {
+        let facts = self.fact_store.read().unwrap();
+        facts
+            .values()
+            .flat_map(|by_key| by_key.values())
+            .map(|f| ((f.document_id.clone(), f.node_id.clone()), f.value.clone()))
+            .collect()
+    }
+
+    /// Is a reference target `(docId, nodeId)` **live** — a real, non-archived
+    /// node, or a committed fact location (§4.3.1 — a fact node lives in
+    /// `fact_store`, not the hosting graph). `src_nodes`/`self_doc` let a
+    /// **self-referential** target (a node in the same document, still in the
+    /// in-hand graph) be resolved without a store read. Read-only; takes only
+    /// per-shard `read()` locks (and the passed snapshot) — the caller must NOT
+    /// hold a shard `write()` while calling this (uniform lock order, F1).
+    fn target_is_live(
+        &self,
+        target: &(DocumentId, NodeId),
+        self_doc: &DocumentId,
+        src_nodes: &[Node],
+        facts: &HashMap<(DocumentId, NodeId), String>,
+    ) -> bool {
+        if &target.0 == self_doc {
+            return src_nodes.iter().any(|n| n.node_id == target.1);
+        }
+        if facts.contains_key(target) {
+            return true;
+        }
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            if let Some(doc) = guard.docs.get(&target.0) {
+                return doc.state != DocState::Archived
+                    && doc.graph.nodes.iter().any(|n| n.node_id == target.1);
+            }
+        }
+        false
+    }
+
+    /// The canonical value a snapshot embed is compared against: the target
+    /// fact's committed `Fact.value`, else the target node's authored `value`.
+    /// Read-only (per-shard `read()` only, no `write()` held by the caller).
+    fn target_canonical_value(
+        &self,
+        target: &(DocumentId, NodeId),
+        self_doc: &DocumentId,
+        src_nodes: &[Node],
+        facts: &HashMap<(DocumentId, NodeId), String>,
+    ) -> Option<String> {
+        if let Some(v) = facts.get(target) {
+            return Some(v.clone());
+        }
+        if &target.0 == self_doc {
+            return src_nodes
+                .iter()
+                .find(|n| n.node_id == target.1)
+                .and_then(|n| n.value.clone());
+        }
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            if let Some(doc) = guard.docs.get(&target.0) {
+                if let Some(n) = doc.graph.nodes.iter().find(|n| n.node_id == target.1) {
+                    return n.value.clone();
+                }
+            }
+        }
+        None
+    }
+
+    /// §4.4.2 / F4 / F5 — derive the **true** reference state of a
+    /// `link`/`embed`/`crosslink` edge from the **target's liveness** (exists +
+    /// not archived, or a committed fact) and, for a snapshot `embed`, from
+    /// **snapshot-vs-canonical**:
+    ///
+    /// - target missing/archived → `BROKEN` (`link`) / `STALE` (`embed`);
+    /// - live target: link → `RESOLVED`; embed with snapshot == canonical →
+    ///   `FRESH`, snapshot != canonical → `STALE`.
+    ///
+    /// `src_nodes` is the source document's node set; `self_doc` its id (for
+    /// self-referential targets). Never trusts a caller-supplied state — this is
+    /// ground truth from the store (§4.4.1 "every link must resolve to a live,
+    /// non-stale target").
+    fn derive_reference_state(
+        &self,
+        edge: &Edge,
+        self_doc: &DocumentId,
+        src_nodes: &[Node],
+        facts: &HashMap<(DocumentId, NodeId), String>,
+    ) -> ReferenceState {
+        let is_embed = match edge.kind {
+            EdgeKind::Embed => true,
+            EdgeKind::Link => false,
+            EdgeKind::Crosslink => src_nodes
+                .iter()
+                .any(|n| n.node_id == edge.source.1 && n.value.is_some()),
+            _ => false,
+        };
+        let live = self.target_is_live(&edge.target, self_doc, src_nodes, facts);
+        if is_embed {
+            if !live {
+                return ReferenceState::Stale;
+            }
+            let snapshot = src_nodes
+                .iter()
+                .find(|n| n.node_id == edge.source.1)
+                .and_then(|n| n.value.clone());
+            let canonical = self.target_canonical_value(&edge.target, self_doc, src_nodes, facts);
+            match (snapshot, canonical) {
+                (Some(s), Some(c)) if s == c => ReferenceState::Fresh,
+                (Some(_), Some(_)) => ReferenceState::Stale,
+                _ => ReferenceState::Fresh,
+            }
+        } else if live {
+            ReferenceState::Resolved
+        } else {
+            ReferenceState::Broken
+        }
+    }
+
+    /// Re-stamp reference-edge states that carry no caller state (`None`) and
+    /// are **not** cross-wiki (a cross-wiki target lives in another wiki/store
+    /// and cannot be verified locally, so its stored state is preserved) from
+    /// the target's liveness / snapshot-vs-canonical (F4 target-change
+    /// propagation). Explicit caller states are left untouched. Mutates the
+    /// in-hand `graph` in place. Read-only w.r.t. locks.
+    fn derive_unstated_reference_states(
+        &self,
+        graph: &mut Graph,
+        self_doc: &DocumentId,
+        facts: &HashMap<(DocumentId, NodeId), String>,
+    ) {
+        for edge in graph.edges.iter_mut() {
+            if !matches!(
+                edge.kind,
+                EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+            ) {
+                continue;
+            }
+            if edge.cross_wiki {
+                continue;
+            }
+            if edge.state.is_some() {
+                continue;
+            }
+            edge.state = Some(self.derive_reference_state(edge, self_doc, &graph.nodes, facts));
+        }
+    }
+
+    /// §4.4.3 "On fact update": when a fact's value changes, every **snapshot
+    /// embed** edge (same-wiki *and* cross-wiki) whose target is the changed
+    /// fact's location becomes `STALE`; a `link` to that fact stays `RESOLVED`
+    /// (§4.4.2 live resolution). Also marks any community that incorporates the
+    /// fact `STALE` (§4.4.1a). Each affected document's shard is written one at
+    /// a time (a shard write is never held while acquiring another) — no
+    /// deadlock; the caller holds the mutation's integrity read lock.
+    fn propagate_fact_staleness(&self, fact_loc: &(DocumentId, NodeId)) {
+        for shard in self.shards.iter() {
+            let affected: Vec<DocumentId> = {
+                let guard = shard.read().unwrap();
+                guard
+                    .docs
+                    .values()
+                    .filter(|doc| {
+                        doc.graph.edges.iter().any(|e| {
+                            matches!(
+                                e.kind,
+                                EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                            ) && &e.target == fact_loc
+                                && self.is_snapshot_embed(e, doc)
+                        })
+                    })
+                    .map(|d| d.document_id.clone())
+                    .collect()
+            };
+            for id in affected {
+                let mut guard = shard.write().unwrap();
+                let Some(arc) = guard.docs.get(&id).cloned() else {
+                    continue;
+                };
+                let cur = (*arc).clone();
+                let edges: Vec<Edge> = cur
+                    .graph
+                    .edges
+                    .iter()
+                    .map(|e| {
+                        let stales = matches!(
+                            e.kind,
+                            EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                        ) && &e.target == fact_loc
+                            && self.is_snapshot_embed(e, &cur);
+                        if stales {
+                            Edge {
+                                state: Some(ReferenceState::Stale),
+                                ..e.clone()
+                            }
+                        } else {
+                            e.clone()
+                        }
+                    })
+                    .collect();
+                guard.docs.insert(
+                    id.clone(),
+                    Arc::new(Document {
+                        revision: cur.revision + 1,
+                        graph: Graph {
+                            nodes: cur.graph.nodes.clone(),
+                            edges,
+                        },
+                        updated_at: iso_now(),
+                        ..cur.clone()
+                    }),
+                );
+                // F7: propagation is an observable mutation — bump the referencing
+                // document's `revision` (above) and record a journal/epoch entry so
+                // the change is visible to the §4.1.4 optimistic-concurrency guard
+                // and the journal/epoch feeds.
+                self.append_journal("propagate_fact_staleness", cur.revision);
+            }
+        }
+        self.mark_communities_stale(std::slice::from_ref(fact_loc));
+    }
+
+    /// §4.4.3 "On reference update" / §4.4.5: when a document is archived, every
+    /// reference edge elsewhere whose target is in the archived document is
+    /// marked — a `link` → `BROKEN`, a snapshot `embed` → `STALE` (§4.4.2). Each
+    /// shard is written one at a time (never two shard write guards held
+    /// together), so it cannot deadlock with any per-document mutation.
+    fn propagate_archived_target(&self, archived_doc: &DocumentId) {
+        for shard in self.shards.iter() {
+            let affected: Vec<DocumentId> = {
+                let guard = shard.read().unwrap();
+                guard
+                    .docs
+                    .values()
+                    .filter(|doc| doc.document_id != *archived_doc)
+                    .filter(|doc| {
+                        doc.graph.edges.iter().any(|e| {
+                            matches!(
+                                e.kind,
+                                EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                            ) && &e.target.0 == archived_doc
+                        })
+                    })
+                    .map(|d| d.document_id.clone())
+                    .collect()
+            };
+            for id in affected {
+                let mut guard = shard.write().unwrap();
+                let Some(arc) = guard.docs.get(&id).cloned() else {
+                    continue;
+                };
+                let cur = (*arc).clone();
+                let edges: Vec<Edge> = cur
+                    .graph
+                    .edges
+                    .iter()
+                    .map(|e| {
+                        let targets_archived = matches!(
+                            e.kind,
+                            EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                        ) && &e.target.0 == archived_doc;
+                        if !targets_archived {
+                            return e.clone();
+                        }
+                        Edge {
+                            state: Some(if self.is_snapshot_embed(e, &cur) {
+                                ReferenceState::Stale
+                            } else {
+                                ReferenceState::Broken
+                            }),
+                            ..e.clone()
+                        }
+                    })
+                    .collect();
+                guard.docs.insert(
+                    id.clone(),
+                    Arc::new(Document {
+                        revision: cur.revision + 1,
+                        graph: Graph {
+                            nodes: cur.graph.nodes.clone(),
+                            edges,
+                        },
+                        updated_at: iso_now(),
+                        ..cur.clone()
+                    }),
+                );
+                // F7: archiving a reference target's propagation is an observable
+                // mutation — bump the referencing document's `revision` and journal.
+                self.append_journal("propagate_archived_target", cur.revision);
+            }
+        }
+    }
 }
 
 impl Default for Store {
@@ -1346,13 +1782,36 @@ impl RagStore for Store {
         // §4.4.5 delete TOCTOU: update can write `link`/`embed`/`crosslink` edges,
         // so it holds the integrity read lock for its whole edge-writing region.
         // Acquired before the shard lock (consistent ordering → no deadlock).
+        //
+        // F4 / F1 deadlock-free rework: the reference-edge **target-change**
+        // derivation (which reads the target's other shard + `fact_store`) runs in
+        // a **read-only pre-pass** under `reference_lock.read()` BEFORE any shard
+        // `write()` is taken — so no path that derives a state holds a shard write
+        // while acquiring another shard's or `fact_store`'s lock (no AB-BA deadlock).
         let _integrity = self.reference_lock.read().unwrap();
+        let base_revision = request.base_revision;
+        // Phase A (read-only): validate + re-stamp `None` reference states from the
+        // new target's liveness (F4 repoint propagation / F2 snapshot-vs-canonical).
+        if !valid_provident_graph(&request.graph) {
+            return Err(StoreError::ValidationError(
+                "graph must be a valid Provident graph (exactly one doc-head and one doc-end)"
+                    .into(),
+            ));
+        }
+        let facts = self.fact_canonical_snapshot();
+        let mut new_graph = request.graph;
+        self.derive_unstated_reference_states(&mut new_graph, document_id, &facts);
+        // GRAPH-OWNS-RELATION-AND-MERGE: a real cascade — a `Relation` edge whose
+        // subject or object node no longer exists in the (replaced) graph is
+        // pruned, so a removed end-point removes the triple (never a zombie that
+        // resurfaces on restore, §4.2.7.5).
+        prune_cascaded_relation_edges(&mut new_graph, document_id);
+        // Phase B: single shard `write()` for the optimistic-concurrency apply.
         let mut guard = self.shard_for(document_id).write().unwrap();
         let current = guard
             .docs
             .get(document_id)
             .ok_or(StoreError::DocumentNotFound)?;
-        let base_revision = request.base_revision;
         let current_revision = current.revision;
         // §4.1.4 optimistic-concurrency guard — atomic under the shard write lock.
         //
@@ -1378,23 +1837,12 @@ impl RagStore for Store {
         } else {
             false
         };
-        if !valid_provident_graph(&request.graph) {
-            return Err(StoreError::ValidationError(
-                "graph must be a valid Provident graph (exactly one doc-head and one doc-end)"
-                    .into(),
-            ));
-        }
-        // GRAPH-OWNS-RELATION-AND-MERGE: a real cascade — a `Relation` edge whose
-        // subject or object node no longer exists in the (replaced) graph is
-        // pruned, so a removed end-point removes the triple (never a zombie that
-        // resurfaces on restore, §4.2.7.5).
-        let mut new_graph = request.graph;
         if reconcile_state_annotations {
             // Preserve the reference-edge states a concurrent `set_reference_state`
-            // stamped onto edges the caller's graph still carries.
+            // stamped onto edges the caller's graph still carries (these override
+            // the derived states from Phase A).
             reconcile_reference_states(&mut new_graph, &current.graph);
         }
-        prune_cascaded_relation_edges(&mut new_graph, document_id);
         let updated = Document {
             document_id: current.document_id.clone(),
             wiki_id: current.wiki_id.clone(),
@@ -1419,6 +1867,17 @@ impl RagStore for Store {
         // (authoritative) graph — drop records whose subject/object node no longer
         // exists (same critical section, after the shard write).
         self.reconcile_triple_store(&updated.graph);
+        // §4.4.1a / §4.4.3 "On community member change": rewriting a node that is
+        // a member of a community marks that community `STALE` (its derived
+        // summary/projection is out of date until re-derived). Any community
+        // holding one of this document's nodes as a member is affected.
+        let member_locs: Vec<(DocumentId, NodeId)> = updated
+            .graph
+            .nodes
+            .iter()
+            .map(|n| (document_id.clone(), n.node_id.clone()))
+            .collect();
+        self.mark_communities_stale(&member_locs);
         self.append_journal("update_document", base_revision);
         Ok(updated)
     }
@@ -1482,50 +1941,92 @@ impl RagStore for Store {
     }
 
     async fn publish_document(&self, document_id: &DocumentId) -> Result<Document, StoreError> {
-        let mut guard = self.shard_for(document_id).write().unwrap();
-        let current = guard
-            .docs
-            .get(document_id)
-            .ok_or(StoreError::DocumentNotFound)?;
-        let held_shard = self.shard_for(document_id);
         // §4.4.3 publish gate — applied to every reference edge
-        // (`link`/`embed`/`crosslink`) in the graph:
+        // (`link`/`embed`/`crosslink`) in the graph.
         //
-        // 1. Explicit state gate. A `BROKEN` reference (any kind) or a `STALE`
-        //    (unsynced) reference blocks publish — §4.4.2 gives all three kinds
-        //    the same reference-state vocabulary, and §4.4.3 forbids publishing
-        //    a doc whose references are unresolved. (Adversarial finding #2.)
-        // 2. Derived target-existence gate. Store-supplied `state` is fabricated
-        //    input, not ground truth: a caller can stamp a `link` `Resolved`
-        //    whose target document does not exist. We derive the true reference
-        //    state by verifying the target `(documentId, nodeId)` exists in the
-        //    store (and is not archived); a missing target is effectively
-        //    `Broken` and blocks publish. Cross-wiki targets (`cross_wiki: true`)
-        //    live in another wiki/store and cannot be verified locally, so their
-        //    stored state is honored. (Adversarial finding #4.)
-        for edge in &current.graph.edges {
-            if !matches!(
-                edge.kind,
-                EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
-            ) {
-                continue;
-            }
-            if let Some(s) = edge.state {
-                if s == ReferenceState::Broken || s == ReferenceState::Stale {
+        // F1 (deadlock-free rework): the gate is validated under **SHARD READ** /
+        // `fact_store.read()` / community **read** locks only — never holding a
+        // shard `write()` while acquiring another shard's or `fact_store`'s lock
+        // (the uniform order `reference_lock → shard/fact_store`). Then the
+        // `DRAFT→PUBLISHED` transition re-acquires `reference_lock.read()` and the
+        // single document's shard `write()`. No path holds a shard write while
+        // acquiring another shard or `fact_store`, and no fact-commit holds
+        // `fact_store.write()` while acquiring a shard → no AB-BA deadlock.
+        //
+        // (ii) ALL publish-gate validation under read locks. All reads are
+        // synchronous and scoped so no non-Send `std::sync` guard is held across
+        // an `.await` (the async future must stay `Send`), and no shard `write()`
+        // is held while acquiring another shard / `fact_store`.
+        let base = {
+            let _integrity = self.reference_lock.read().unwrap();
+            let current = {
+                let guard = self.shard_for(document_id).read().unwrap();
+                guard
+                    .docs
+                    .get(document_id)
+                    .map(|d| (**d).clone())
+                    .ok_or(StoreError::DocumentNotFound)?
+            };
+            let facts = self.fact_canonical_snapshot();
+            for edge in &current.graph.edges {
+                if !matches!(
+                    edge.kind,
+                    EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                ) {
+                    continue;
+                }
+                // 1. Explicit state gate. A `BROKEN` reference (any kind) or a
+                //    `STALE` (unsynced) reference blocks publish — §4.4.2 gives all
+                //    three kinds the same reference-state vocabulary (§4.4.3;
+                //    adversarial #2).
+                if let Some(s) = edge.state {
+                    if s == ReferenceState::Broken || s == ReferenceState::Stale {
+                        return Err(StoreError::UnresolvedReference);
+                    }
+                }
+                // 2. Derived target-liveness gate (adversarial #4). Store-supplied
+                //    `state` is fabricated input, not ground truth — the true state
+                //    is derived from the target `(documentId, nodeId)` being live
+                //    (exists + not archived) or a committed fact (§4.4.1). Cross-wiki
+                //    targets (`cross_wiki: true`) live in another wiki/store and
+                //    cannot be verified locally, so their stored state is honored.
+                if !edge.cross_wiki
+                    && !self.target_is_live(&edge.target, document_id, &current.graph.nodes, &facts)
+                {
                     return Err(StoreError::UnresolvedReference);
                 }
             }
-            if !edge.cross_wiki
-                && !reference_target_exists(&guard.docs, held_shard, &self.shards, &edge.target)
-            {
+            // §4.4.1a / §4.4.3 community-staleness gate: a node of this document that
+            // is a member of a `STALE` (not yet re-derived) community blocks publish.
+            if current.graph.nodes.iter().any(|n| {
+                let states = self.community_states.read().unwrap();
+                let comms = self.communities.read().unwrap();
+                comms.values().any(|c| {
+                    states
+                        .get(&c.community_id)
+                        .copied()
+                        .unwrap_or(CommunityState::Fresh)
+                        == CommunityState::Stale
+                        && c.members
+                            .contains(&(document_id.clone(), n.node_id.clone()))
+                })
+            }) {
                 return Err(StoreError::UnresolvedReference);
             }
-        }
-        if !current.state.can_transition_to(DocState::Published) {
-            return Err(StoreError::InvalidState);
-        }
-        let base = current.revision;
+            if !current.state.can_transition_to(DocState::Published) {
+                return Err(StoreError::InvalidState);
+            }
+            // (iii) release all read locks (`integrity`/`current`/`facts` drop at
+            // the end of this block).
+            current.revision
+        };
+        // (iv) re-acquire + single doc's shard write for the DRAFT→PUBLISHED
+        // transition (transition re-checks `DocumentNotFound` / `can_transition`).
+        let integrity2 = self.reference_lock.read().unwrap();
+        let mut guard = self.shard_for(document_id).write().unwrap();
         let updated = transition(&mut guard, document_id, DocState::Published)?;
+        drop(guard);
+        drop(integrity2);
         self.append_journal("publish_document", base);
         Ok(updated)
     }
@@ -1546,16 +2047,28 @@ impl RagStore for Store {
     }
 
     async fn archive_document(&self, document_id: &DocumentId) -> Result<Document, StoreError> {
-        let mut guard = self.shard_for(document_id).write().unwrap();
-        let current = guard
-            .docs
-            .get(document_id)
-            .ok_or(StoreError::DocumentNotFound)?;
-        if current.state == DocState::Archived {
-            return Err(StoreError::InvalidState);
-        }
-        let base = current.revision;
-        let updated = transition(&mut guard, document_id, DocState::Archived)?;
+        // §4.4.3 "On reference update": archiving a reference *target* marks a
+        // `link` to it `BROKEN` and an `embed` of it `STALE` (§4.4.2). The scan+
+        // propagate holds the store-wide integrity read lock so a concurrent
+        // reference-edge write cannot race it (same ordering as the delete gate:
+        // `reference_lock` → shard). The target's own shard write is released
+        // before the cross-shard propagation so no two shard writes are held at
+        // once — no deadlock.
+        let _integrity = self.reference_lock.read().unwrap();
+        let (updated, base) = {
+            let mut guard = self.shard_for(document_id).write().unwrap();
+            let current = guard
+                .docs
+                .get(document_id)
+                .ok_or(StoreError::DocumentNotFound)?;
+            if current.state == DocState::Archived {
+                return Err(StoreError::InvalidState);
+            }
+            let base = current.revision;
+            let updated = transition(&mut guard, document_id, DocState::Archived)?;
+            (updated, base)
+        };
+        self.propagate_archived_target(document_id);
         self.append_journal("archive_document", base);
         Ok(updated)
     }
@@ -2046,7 +2559,13 @@ impl RagStore for Store {
         self.communities
             .write()
             .unwrap()
-            .insert(community_id, community.clone());
+            .insert(community_id.clone(), community.clone());
+        // §4.4.3: a freshly declared community is `Fresh` — its derived summary
+        // reflects its current members (§4.2.8.3, asserted by the §4.4 suite).
+        self.community_states
+            .write()
+            .unwrap()
+            .insert(community_id, CommunityState::Fresh);
         self.append_journal("declare_community", 0);
         Ok(community)
     }
@@ -2387,12 +2906,12 @@ impl RagStore for Store {
             ));
         }
         // Grounding + uniqueness + commit are atomic under the store-wide
-        // integrity `read` lock (a concurrent `delete_document` holds the `write`
-        // side, so it cannot interleave), and the grounding is **re-verified**
-        // inside the `fact_store.write()` critical section (H1 TOCTOU: a
-        // concurrent delete cannot leave a dangling citation between the
-        // pre-lock shard reads and the commit). Lock order `reference_lock →
-        // shard → fact_store` matches every other mutation → no deadlock.
+        // integrity `read` lock: a concurrent `delete_document` holds the `write`
+        // side, so it cannot remove a cited node between the grounding reads and
+        // the commit — no dangling-citation TOCTOU. Grounding runs **before** the
+        // `fact_store.write()` critical section, so the fact-commit paths never
+        // hold `fact_store.write()` while acquiring a shard `read()` (F1: uniform
+        // lock order `reference_lock → shard → fact_store`, no AB-BA deadlock).
         let _integrity = self.reference_lock.read().unwrap();
         // Grounding: every citation resolves to a real node (fail-closed §4.3.2a.2).
         for (cdoc, cnode) in citations {
@@ -2400,11 +2919,6 @@ impl RagStore for Store {
         }
         // §4.3.1: factKey unique within the Wiki.
         let mut facts = self.fact_store.write().unwrap();
-        // H1 TOCTOU guard: re-verify every citation still resolves to a real node
-        // inside the same write critical section that commits the fact.
-        for (cdoc, cnode) in citations {
-            self.read_node(cdoc, cnode)?;
-        }
         let by_key = facts.entry(wiki_id.clone()).or_default();
         if by_key.contains_key(fact_key) {
             return Err(StoreError::ConflictError);
@@ -2525,9 +3039,11 @@ impl RagStore for Store {
             ));
         }
         // Grounding + apply are atomic under the integrity `read` lock (a
-        // concurrent `delete_document` holds the `write` side), and grounding is
-        // **re-verified** inside the `fact_store.write()` critical section (H1
-        // TOCTOU guard — a concurrent delete cannot leave a dangling citation).
+        // concurrent `delete_document` holds the `write` side, so a cited node
+        // cannot be removed between the grounding reads and the apply — no
+        // dangling-citation TOCTOU). Grounding runs **before** the `fact_store`
+        // write lock, so `update_fact` never holds `fact_store.write()` while
+        // acquiring a shard `read()` (F1: uniform lock order, no deadlock).
         let _integrity = self.reference_lock.read().unwrap();
         // Grounding (§4.3.2a.2): every citation must resolve to a real node.
         for (cdoc, cnode) in &request.citations {
@@ -2540,15 +3056,6 @@ impl RagStore for Store {
         // Unknown fact → `DocumentNotFound` (§4.3.2). Compare-then-apply under the
         // `fact_store` write lock so the update is atomic with the existence check.
         let mut facts = self.fact_store.write().unwrap();
-        // H1 TOCTOU guard: re-verify every citation still resolves under the write
-        // lock that applies the update.
-        for (cdoc, cnode) in &request.citations {
-            if self.read_node(cdoc, cnode).is_err() {
-                return Err(StoreError::ValidationError(
-                    "citation does not resolve".into(),
-                ));
-            }
-        }
         let by_key = match facts.get_mut(wiki_id) {
             Some(m) => m,
             None => return Err(StoreError::DocumentNotFound),
@@ -2569,6 +3076,12 @@ impl RagStore for Store {
         existing.updated_at = iso_now();
         let updated = existing.clone();
         drop(facts);
+        // §4.4.3 "On fact update": the fact's canonical value changed, so every
+        // snapshot embed (same-wiki and cross-wiki) of this fact becomes `STALE`,
+        // links stay `RESOLVED`, and every community incorporating the fact
+        // becomes `STALE`. Runs under the mutation's integrity read lock; each
+        // affected shard is written one at a time (no two shard writes held).
+        self.propagate_fact_staleness(&(updated.document_id.clone(), updated.node_id.clone()));
         self.append_journal("update_fact", 0);
         Ok(updated)
     }
@@ -2610,9 +3123,11 @@ impl RagStore for Store {
             ));
         }
         // Grounding + commit are atomic under the integrity `read` lock (a
-        // concurrent `delete_document` holds the `write` side), and grounding is
-        // **re-verified** inside the `fact_store.write()` critical section (H1
-        // TOCTOU — a concurrent delete cannot leave a dangling citation).
+        // concurrent `delete_document` holds the `write` side, so a cited node
+        // cannot be removed between the grounding reads and the commit — no
+        // dangling-citation TOCTOU). Grounding runs **before** the `fact_store`
+        // write lock, so commit paths never hold `fact_store.write()` while
+        // acquiring a shard `read()` (F1: uniform lock order, no deadlock).
         let _integrity = self.reference_lock.read().unwrap();
         // Grounding/provenance (§4.3.2a.4): a dangling citation → `Err`
         // `ValidationError("citation does not resolve")`, nothing committed.
@@ -2628,15 +3143,6 @@ impl RagStore for Store {
         // `ConflictError`; no partial commit). The whole gate above ran before
         // any write, so a rejected candidate leaves the store untouched.
         let mut facts = self.fact_store.write().unwrap();
-        // H1 TOCTOU guard: re-verify every citation still resolves under the write
-        // lock that commits the fact.
-        for (cdoc, cnode) in &candidate.citations {
-            if self.read_node(cdoc, cnode).is_err() {
-                return Err(StoreError::ValidationError(
-                    "citation does not resolve".into(),
-                ));
-            }
-        }
         let by_key = facts.entry(wiki_id.clone()).or_default();
         if by_key.contains_key(&candidate.fact_key) {
             return Err(StoreError::ConflictError);
@@ -2674,6 +3180,203 @@ impl RagStore for Store {
         // recorded entries (empty on a fresh store).
         Ok(Vec::new())
     }
+
+    // -----------------------------------------------------------------------
+    // §4.4 — Consistency enforcement surface — COMPILING STUBS (RED).
+    //
+    // These stub bodies intentionally implement NO §4.4 staleness logic — the
+    // TDD gate is RED-first and the Implementer lands the real logic next. They
+    // exist ONLY so the §4.4 TestWriter's `tests/consistency_integration.rs`
+    // compiles against the extended `RagStore` surface and FAILS at runtime.
+    // -----------------------------------------------------------------------
+
+    async fn get_consistency_report(
+        &self,
+        wiki_id: &WikiId,
+    ) -> Result<Vec<ConsistencyReferenceReport>, StoreError> {
+        // FS-2 (§4.4.4): unknown wiki → `WikiNotFound`.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        // One row per reference edge (`link`/`embed`/`crosslink`) whose **source
+        // document** is in `wiki_id` — including `crosslink` edges whose target
+        // lives in another wiki. `state` is the reference edge's stored
+        // `ReferenceState`, or — for an edge stored with `state: None` (F2/F4/F5 a
+        // fabricatable default would lie) — derived from the **target's liveness**
+        // and (for a snapshot embed) **snapshot-vs-canonical** (§4.4.2/§4.4.3).
+        // Read-only: `fact_store.read()` is snapshot into a local map first (then
+        // released) and only per-shard `read()`s are held — deadlock-free.
+        let facts = self.fact_canonical_snapshot();
+        let mut report = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            for doc in guard.docs.values() {
+                if doc.wiki_id != *wiki_id {
+                    continue;
+                }
+                for e in doc.graph.edges.iter() {
+                    if !matches!(
+                        e.kind,
+                        EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                    ) {
+                        continue;
+                    }
+                    let state = match e.state {
+                        Some(s) => s,
+                        None => self.derive_reference_state(
+                            e,
+                            &doc.document_id,
+                            &doc.graph.nodes,
+                            &facts,
+                        ),
+                    };
+                    report.push(ConsistencyReferenceReport {
+                        document_id: doc.document_id.clone(),
+                        node_id: e.source.1.clone(),
+                        kind: e.kind,
+                        state,
+                        target: e.target.clone(),
+                        cross_wiki: e.cross_wiki,
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn re_sync_embed(
+        &self,
+        document_id: &DocumentId,
+        node_id: &NodeId,
+    ) -> Result<Document, StoreError> {
+        // §4.4.3: re-sync a `STALE` embed — update the reference node's snapshot
+        // (`value`) to the target fact's canonical `Fact.value` (found in
+        // `fact_store` under the embed edge's target), flip the embed edge to
+        // `FRESH`, and bump the referencing document's `revision`.
+        //
+        // Locking: the canonical fact values are snapshotted into a local map
+        // under `fact_store.read()` **before** the shard write is taken, so the
+        // shard write and the `fact_store` read are never held together — this
+        // avoids the fact-update ↔ re-sync deadlock (one holding `fact_store`
+        // write while scanning shards, the other holding a shard write while
+        // reading `fact_store`).
+        let _integrity = self.reference_lock.read().unwrap();
+        let fact_values: HashMap<(DocumentId, NodeId), String> = {
+            let facts = self.fact_store.read().unwrap();
+            facts
+                .values()
+                .flat_map(|by_key| by_key.values())
+                .map(|f| ((f.document_id.clone(), f.node_id.clone()), f.value.clone()))
+                .collect()
+        };
+        let mut guard = self.shard_for(document_id).write().unwrap();
+        let current = guard
+            .docs
+            .get(document_id)
+            .ok_or(StoreError::DocumentNotFound)?;
+        let current = (**current).clone();
+        let base = current.revision;
+        // The node must be a `Reference` node with an embed (snapshot) edge.
+        let node = current.graph.nodes.iter().find(|n| &n.node_id == node_id);
+        let node_ok = matches!(node, Some(n) if n.kind == NodeKind::Reference);
+        let embed_edge = current.graph.edges.iter().find(|e| {
+            e.source == (document_id.clone(), node_id.clone())
+                && matches!(e.kind, EdgeKind::Embed | EdgeKind::Crosslink)
+        });
+        let (Some(edge), true) = (embed_edge, node_ok) else {
+            return Err(StoreError::ValidationError(
+                "node is not an embed reference node".into(),
+            ));
+        };
+        let canonical = fact_values.get(&edge.target).cloned().ok_or_else(|| {
+            StoreError::ValidationError("embed target has no canonical value to re-sync".into())
+        })?;
+        let nodes: Vec<Node> = current
+            .graph
+            .nodes
+            .iter()
+            .map(|n| {
+                if &n.node_id == node_id {
+                    Node {
+                        value: Some(canonical.clone()),
+                        ..n.clone()
+                    }
+                } else {
+                    n.clone()
+                }
+            })
+            .collect();
+        let edges: Vec<Edge> = current
+            .graph
+            .edges
+            .iter()
+            .map(|e| {
+                if e.source == (document_id.clone(), node_id.clone())
+                    && matches!(e.kind, EdgeKind::Embed | EdgeKind::Crosslink)
+                {
+                    Edge {
+                        state: Some(ReferenceState::Fresh),
+                        ..e.clone()
+                    }
+                } else {
+                    e.clone()
+                }
+            })
+            .collect();
+        let updated = Document {
+            revision: base + 1,
+            graph: Graph { nodes, edges },
+            updated_at: iso_now(),
+            ..current
+        };
+        guard
+            .docs
+            .insert(document_id.clone(), Arc::new(updated.clone()));
+        self.append_journal("re_sync_embed", base);
+        Ok(updated)
+    }
+
+    async fn re_derive_community(
+        &self,
+        community_id: &CommunityId,
+    ) -> Result<Community, StoreError> {
+        // §4.4.3: re-derive a `STALE` community. Automatic summary derivation is
+        // PARKED (F4), so re-derive = clear the `STALE` flag (refresh to `Fresh`);
+        // the manual summary is authoritative and never regenerated (§4.2.8.4).
+        let community = self
+            .communities
+            .read()
+            .unwrap()
+            .get(community_id)
+            .cloned()
+            .ok_or(StoreError::CommunityNotFound)?;
+        self.community_states
+            .write()
+            .unwrap()
+            .insert(community_id.clone(), CommunityState::Fresh);
+        self.append_journal("re_derive_community", 0);
+        Ok(community)
+    }
+
+    async fn community_state(
+        &self,
+        community_id: &CommunityId,
+    ) -> Result<CommunityState, StoreError> {
+        // FS: unknown community → `CommunityNotFound`.
+        if !self.communities.read().unwrap().contains_key(community_id) {
+            return Err(StoreError::CommunityNotFound);
+        }
+        // §4.4.1a / §4.4.3: `Fresh` by default (a community whose staleness was
+        // never triggered — including one declared before the §4.4 map was
+        // populated) until a member change / incorporated-fact change marks it.
+        Ok(self
+            .community_states
+            .read()
+            .unwrap()
+            .get(community_id)
+            .copied()
+            .unwrap_or(CommunityState::Fresh))
+    }
 }
 
 /// The machine-actionable fail-closed rejection `{code, field, message}`
@@ -2689,39 +3392,6 @@ fn rejected_outcome(code: &str, field: &str, message: &str) -> ProposalOutcome {
             message: message.to_string(),
         }),
     }
-}
-
-/// Does a reference target `(docId, nodeId)` exist in the store as a **live**
-/// (non-archived) node? Used by the §4.4.3 publish gate to derive the true
-/// reference state instead of trusting caller-supplied `state` (which is
-/// fabricated input, not ground truth).
-///
-/// `held` is the hash map of the shard currently held under a write guard (the
-/// publishing document's own shard), and `held_shard` identifies that same
-/// shard so we skip re-locking it — `std::sync::RwLock` is **not** reentrant, so
-/// a self-referential target in the held shard must be resolved from the
-/// in-hand map, not by taking the shard `read()` again.
-fn reference_target_exists(
-    held: &HashMap<DocumentId, Arc<Document>>,
-    held_shard: &RwLock<StoreShard>,
-    shards: &[RwLock<StoreShard>],
-    target: &(DocumentId, NodeId),
-) -> bool {
-    if let Some(doc) = held.get(&target.0) {
-        return doc.state != DocState::Archived
-            && doc.graph.nodes.iter().any(|n| n.node_id == target.1);
-    }
-    for shard in shards {
-        if std::ptr::eq(shard, held_shard) {
-            continue;
-        }
-        let guard = shard.read().unwrap();
-        if let Some(doc) = guard.docs.get(&target.0) {
-            return doc.state != DocState::Archived
-                && doc.graph.nodes.iter().any(|n| n.node_id == target.1);
-        }
-    }
-    false
 }
 
 /// Replace the stored document under a shard write guard with a new state.
