@@ -24,6 +24,18 @@ IPC/HTTP transport between the shell and Gnosis over the `RagStore` +
 `ragQuery`/`ragStream`/`engine-status` interface). The dated entries below are the
 historical scaffold→implemented record.
 
+**§4.5-DEFERRED REVISIT (2026-09-09, change-analysis pass):** the four
+`ENGINE-INTERNAL DEFERRED` rows previously framed as "revisit with §4.5" were
+re-derived against the actual crate now that §4.5 has landed:
+**audit-log recording sink — RESOLVED** (landed in §4.5: `rag_query`/`rag_stream`
+append real `QueryAuditEntry`s; §4.3.4 returns real entries, pinned by two tests);
+**fact-store sharding — KEEP DEFERRED** (re-scoped to a **measured** contention/throughput signal; no §4.5 load path justifies it yet); **fact `node_id` coherence — CLOSED** as a spec-wording tension (`factKey` is the canonical identity; engine will not materialize fact nodes); **cross-field consistency gate — CLOSED** as a documented non-goal (deterministic fail-closed gate; reconcile spec §4.3.2a.1 as aspirational/offline). All recorded in `docs/pending.md` + `docs/defects.md`; the two closures carry spec-reconcile notes in `docs/HANDOFF.md`. None of the four requires new engine work.
+
+**DOC-REVIEW QUICK-PIN PASS (2026-09-09, next):** the four doc-review gaps that
+are implementable/checkable now (engine ids not RFC-4122 UUID v4 — deferred to F2
+seam; `createdAt`/`updatedAt` ISO-8601 format; `author` round-trip; `MultiQueryExpansionFailed`
+reachability) are the next test-authoring delegates.
+
 **PBT-GATE RETROFIT (2026-09-09, decision PBT-GATE-MANDATORY):** the mandatory
 property-based-testing gate now applies to every code-bearing unit. Five typed
 property registers (`docs/specs/4-*-property-register.md`, P-IM/P-SM/P-TP ≤8 rows
