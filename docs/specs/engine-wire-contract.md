@@ -330,8 +330,10 @@ pub enum ValidationFailure {
 ```rust
 // Strict decode of a RagResult body from a JSON value.
 pub fn decode_rag_result(json: &serde_json::Value) -> Result<RagResult, DecodeError>;
-//   - structurally malformed (wrong field types, invalid enum, etc.)  -> Err(InvalidJson(_))   [FS-9 route]
-//   - structurally well-formed but trace absent                        -> Err(MissingTrace)      [FS-10 route]
+//   - a body with NO "trace" KEY (regardless of any other structural issue)  -> Err(MissingTrace) [FS-10 route]
+//     (trace-presence is checked FIRST so a well-formed-but-traceless body stays FS-10; both
+//     FS-9 and FS-10 map to HTTP 502 at the shell, so this precedence only changes the wire code)
+//   - otherwise structurally malformed (wrong field types, invalid enum, etc.) -> Err(InvalidJson(_)) [FS-9 route]
 //   - otherwise -> Ok(valid RagResult)
 
 // Post-decode validation of a constructed/decoded RagResult against the
@@ -541,8 +543,9 @@ defaults **deserialization**; the field is always **serialized**.)
   ```
 
 **V-9 — decode-then-validate vector pair:**
-- A body missing `trace` → `DecodeError::MissingTrace` → `outcome_of` → `RagChunk::Error(StoreError::TraceUnavailable)`.
-- A truncated/`null` body or wrong field type → `DecodeError::InvalidJson(_)` → `outcome_of` → `RagChunk::Error(StoreError::EngineError)`.
+- A body missing `trace` (trace-presence checked first) → `DecodeError::MissingTrace` → `outcome_of` → `RagChunk::Error(StoreError::TraceUnavailable)`.
+- A truncated/`null` body, or wrong field type **with a `trace` key present** → `DecodeError::InvalidJson(_)` → `outcome_of` → `RagChunk::Error(StoreError::EngineError)`.
+- **Precedence (pinned):** `decode_rag_result` checks trace-`key`-presence BEFORE structural type-deserialization, so a body that is both missing `trace` AND structurally malformed (e.g. `{"query":123}`) yields `MissingTrace` → `TraceUnavailable` (not `EngineError`). This keeps FS-10 reachable (a well-formed-but-traceless body would otherwise fail the required-`trace` serde parse and map to `EngineError`); both codes map to HTTP 502 at the shell so the rendered status is identical.
 
 ---
 
