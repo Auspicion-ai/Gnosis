@@ -31,6 +31,16 @@ prerequisites:** a C linker (`gcc`/`cc`), `pkg-config`, and `libssl-dev` (for
 backend can be switched to `rustls` at the cost of a `cmake`-building provider —
 currently the native-tls default is kept.
 
+**Data-structure & concurrency plan (2026-09-09):** the pre-implementation design
+is `docs/research/gnosis-data-structures-concurrency-plan.md` — answers live-
+update/overlay, speed-at-volume under concurrent requests, and Safe-Rust
+mutable+shared tension via ownership splitting. Decisions pinned:
+SHARDED-RWLOCK-STORE, IMMUTABLE-DERIVED-SNAPSHOT, WRITER-ACTOR-JOURNAL,
+LAYERED-OVERLAY, ARC-SHARED-ENGINE (`docs/decisions.md`). The core-unit TestWriter
+red sets (§4.1–§4.4) must now exercise the concurrency / optimistic-concurrency /
+overlay states that this plan pins. The §4.1–§4.4 core unit is **ready to delegate**
+at the TDD gate once the plan is approved.
+
 ## OPEN
 
 | Unit | Status | Notes |
