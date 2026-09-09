@@ -3,8 +3,6 @@
 //! A pure backend to the Astrographer shell. It serves the `RagStore` +
 //! query/stream/engine-status API the shell proxies. It has no MCP/GUI surface.
 
-use gnosis::store::RagStore;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Engine boot: load the store, build the lexical/vector indexes, then

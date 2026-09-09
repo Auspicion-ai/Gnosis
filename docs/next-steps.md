@@ -23,6 +23,14 @@ so build reproducibility is pinned. First archival-loop pass run — nothing to
 archive yet (no obsolete docs or findings reports exist at the scaffold stage);
 all citations verified against current files.
 
+**Trio green at scaffold (2026-09-09):** `cargo build`, `cargo test`
+(1 scaffold test), `cargo clippy --all-targets`, and `cargo fmt --check` are all
+clean after installing the host build prerequisites. **Linux build/dep
+prerequisites:** a C linker (`gcc`/`cc`), `pkg-config`, and `libssl-dev` (for
+`reqwest`'s native-tls TLS). If a CI/consumer host lacks them, `reqwest`'s TLS
+backend can be switched to `rustls` at the cost of a `cmake`-building provider —
+currently the native-tls default is kept.
+
 ## OPEN
 
 | Unit | Status | Notes |

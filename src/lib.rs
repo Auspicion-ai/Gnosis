@@ -9,7 +9,7 @@
 //! from that spec.
 
 pub mod consistency; // §4.4 consistency enforcement
-pub mod facts;       // §4.3 fact/citation tracking
-pub mod graph;       // §4.2 knowledge graph (subject-relation model, entity resolution)
-pub mod retrieval;   // §4.5 RAG/agent-memory retrieval (query modes + vector fields)
-pub mod store;       // §4.1 document store (persistence, RAG store interface)
+pub mod facts; // §4.3 fact/citation tracking
+pub mod graph; // §4.2 knowledge graph (subject-relation model, entity resolution)
+pub mod retrieval; // §4.5 RAG/agent-memory retrieval (query modes + vector fields)
+pub mod store; // §4.1 document store (persistence, RAG store interface)

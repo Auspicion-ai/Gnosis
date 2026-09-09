@@ -9,5 +9,7 @@
 // RAG/agent-memory, query modes/surfaces) before any implementation.
 #[test]
 fn scaffold_compiles() {
-    assert!(true);
+    // Placeholder: proves the crate + dev-dependencies (tokio, wiremock) build and link.
+    // The real behavior tests supersede this once the impl units land.
+    let _ = "scaffold";
 }
