@@ -38,17 +38,26 @@ mutable+shared tension via ownership splitting. Decisions pinned:
 SHARDED-RWLOCK-STORE, IMMUTABLE-DERIVED-SNAPSHOT, WRITER-ACTOR-JOURNAL,
 LAYERED-OVERLAY, ARC-SHARED-ENGINE (`docs/decisions.md`). The core-unit TestWriter
 red sets (§4.1–§4.4) must now exercise the concurrency / optimistic-concurrency /
-overlay states that this plan pins. The §4.1–§4.4 core unit is **ready to delegate**
-at the TDD gate once the plan is approved.
+overlay states that this plan pins.
+
+**§4.1 document store DONE (2026-09-09).** TDD red→green to green with the
+adversarial findings fixed; full details in the DONE row below. The next unit to
+delegate is **§4.2 knowledge graph** (nodes/edges/properties, subject-relation
+model, entity resolution, manual overrides), which attaches to the store's new
+journal/epoch feed.
 
 ## OPEN
 
 | Unit | Status | Notes |
 | --- | --- | --- |
-| **The doc-store + knowledge-graph + fact/citation + consistency core** (spec §4.1–§4.4) | ready to delegate | The document store (§4.1), knowledge graph §4.2 (nodes/edges/properties, subject-relation model, entity resolution, manual overrides), fact/citation (§4.3), and consistency enforcement (§4.4) form the core engine. Delegate per unit (RCA-5): each its own TestWriter-red → Implementer-green → adversarial → blind-greens → doc-review cycle, from the spec ALONE. |
-| **The RAG/agent-memory retrieval stack** (spec §4.5–§4.6) | ready to delegate (second) | The query modes (`flat`/`graph`/`vector`/`hybrid`), the retrieval stack (lexical BM25, reranking, multi-query, compression, HyDE, sub-task DAG), multiple vector fields, the agent-memory surface, and the query/stream/engine-status API. Delegate per unit after the core lands. |
+| **Knowledge graph** (spec §4.2) | ready to delegate (next) | Nodes/edges/properties, `reference`→`fact` graph, subject-relation triple model (§4.2.7), entity resolution, manual overrides (§4.2.8). Builds on the §4.1 store's journal/epoch feed. Own red→green→adversarial→blind-greens→doc-review cycle, from the spec alone. |
+| **Fact/citation tracking** (spec §4.3) | pending | Fact nodes, citations/provenance, the candidate-fact + deterministic-validation pipeline. After §4.2. |
+| **Consistency enforcement** (spec §4.4) | pending | The consistency invariant, staleness propagation, the publish gate, `getConsistencyReport`. After §4.2/§4.3. |
+| **The RAG/agent-memory retrieval stack** (spec §4.5–§4.6) | ready to delegate (after the core) | The query modes (`flat`/`graph`/`vector`/`hybrid`), the retrieval stack (lexical BM25, reranking, multi-query, compression, HyDE, sub-task DAG), multiple vector fields, the agent-memory surface, and the query/stream/engine-status API. Delegate per unit after the core lands. |
 | **The IPC/HTTP engine seam** (spec §4.6.1, §5.1) | pending | The exact IPC/process transport between the shell and Gnosis (the `RagStore` + query/stream/engine-status seam) — F2 in the spec. Design and delegate once the core API exists. |
 
 ## DONE
 
-_(none yet — the scaffold is in place; implementation units are pending.)_
+| Unit | Red set | Green | Adversarial findings | Blind-greens | Doc-review | Trio |
+| --- | --- | --- | --- | --- | --- | --- |
+| **§4.1 document store** (spec §4.1) | TestWriter red: **41 red + 1 green** at the compile-with-stubs stage; after the red-set fixture corrections, the implementer landed **42/42**, then the adversarial regression set added **8 tests** (5 red) → **50/50** | 50/50 (`tests/store_integration.rs`) + placeholder 1 | **HIGH** out-of-range pagination panic (fixed: clamp/overflow-safe); **MEDIUM** delete TOCTOU dangling-reference (fixed: store-wide reference-integrity `RwLock`); **MEDIUM** crosslink `Broken`/`Stale` not gated on publish (fixed); **MEDIUM** fabricated reference state trusted (fixed: derive state from target existence, skip cross-wiki); **MEDIUM** WRITER-ACTOR-JOURNAL not honored (fixed: minimal mutation journal + epoch feed); concurrency tests were single-threaded false security (fixed: multi-threaded + Barrier); plus low/`unwrap`/ordering notes | pending (documentation gates) | pending (documentation gates) | `cargo test` 51 pass (50 store + 1 placeholder) · `build` clean · `clippy` clean · `fmt` clean |

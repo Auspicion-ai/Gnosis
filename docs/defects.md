@@ -7,11 +7,15 @@ is fixed here.
 
 ## OPEN
 
-_(none yet — the project is scaffolded; no implementation code has been written
-to surface host defects. The suite `docs/defects.md` records GAP-1/GAP-2
-(multi-query, three-way lexical fusion), which are re-pointed to Gnosis as the
-production engine.)_
+_(none open — the §4.1 host defects below are FIXED; see FIXED.)_
 
 ## FIXED
 
-_(none yet.)_
+| Defect | Where fixed | How |
+| --- | --- | --- |
+| §4.1 `list_documents` panics on an out-of-range page / `page: u64::MAX` (overflow + slice OOB) | `src/store/mod.rs` | Clamp: `if start >= total { return empty page }` before any arithmetic/slice; saturating offset. Regression-tested (`list_documents_page_beyond_range_...`, `list_documents_page_u64_max_...`). |
+| §4.1 `delete_document` delete-gate TOCTOU — a reference added between the scan and the remove leaves a dangling reference | `src/store/mod.rs` | Store-wide `reference_lock: RwLock<()>`: delete takes `write()` for the whole scan+remove; edge-adding mutations (`create`/`update_document`) take `read()`. Acquired before shard locks, fixed order → no deadlock. |
+| §4.1 publish gate ignored `crosslink` edges in `Broken`/`Stale` | `src/store/mod.rs` | Gate now matches `link`/`embed`/`crosslink` uniformly: `BROKEN || STALE ⇒ UnresolvedReference`. Regression-tested (`publish_document_with_{broken,stale}_crosslink_...`). |
+| §4.1 publish gate trusted a caller-supplied reference `state` (e.g. fabricated `Resolved` to a nonexistent target) | `src/store/mod.rs` | Publish derives reference state from target existence: a missing/archived target ⇒ `Broken` ⇒ `UnresolvedReference`; cross-wiki edges skip local verification. Regression-tested (`publish_document_with_resolved_link_to_nonexistent_target...`). |
+| §4.1 `concurrent_*` tests ran on a single-threaded runtime with no `.await` → false security | `tests/store_integration.rs` | Converted to `#[tokio::test(flavor="multi_thread", worker_threads=4)]` with a `tokio::sync::Barrier`; validated 5× at `--test-threads=4`. |
+| §4.1 WRITER-ACTOR-JOURNAL (ACTIVE) not honored — mutations were direct, no journal/epoch feed | `src/store/mod.rs` | Added minimal `MutationJournal` (`RwLock<Vec<JournalEntry>>` + `AtomicU64 epoch`) appended in each mutation critical section + `Store::epoch()`/`journal_len()` accessors, honoring the single-writer/epoch-feed intent for the §4.2–§4.4 index-rebuild/audit layers. |
