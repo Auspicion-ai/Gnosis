@@ -19,9 +19,14 @@ through them.
 
 ## Gnosis-local decisions
 
-_(None yet — decisions opened 2026-09-08. The Gnosis spec pins new decision rows
-when the relevant unit lands, e.g. RESULT-LEVEL-PROVENANCE, QUERY-AUDIT-LOG,
-GRAPH-MODE-WALK, REFERENCE-GRAPH-ADDITIVE-FIELDS, FANOUT-INTERLEAVE-MERGE.)_
+| Decision | Date | What it pins |
+| --- | --- | --- |
+| **ARCHIVE-GITIGNORED** | 2026-09-09 | The `archive/` directory is **GITIGNORED** per the archival-loop convention (obsolete docs, stale test data, findings reports, and historical review records move there and are never committed). Content there is local provenance, not part of the tracked repo. |
+| **LOCKFILE-COMMITTED** | 2026-09-09 | Cargo.lock is **committed** for this binary/lib crate so build reproducibility is pinned for consumers of the engine. |
+
+The Gnosis spec pins new decision rows when the relevant unit lands, e.g.
+RESULT-LEVEL-PROVENANCE, QUERY-AUDIT-LOG, GRAPH-MODE-WALK,
+REFERENCE-GRAPH-ADDITIVE-FIELDS, FANOUT-INTERLEAVE-MERGE.
 
 ## SUPERSEDED
 

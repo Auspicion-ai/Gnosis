@@ -17,6 +17,12 @@ relevant research notes (`docs/research/`), the integration-surface docs
 (`docs/integrations/`), the Rust crate skeleton (`Cargo.toml`, `src/`), and the
 trackers are in place. No implementation code has been written yet.
 
+**Housekeeping (2026-09-09):** `archive/` is now gitignored (decision
+ARCHIVE-GITIGNORED) and `Cargo.lock` is committed (decision LOCKFILE-COMMITTED)
+so build reproducibility is pinned. First archival-loop pass run — nothing to
+archive yet (no obsolete docs or findings reports exist at the scaffold stage);
+all citations verified against current files.
+
 ## OPEN
 
 | Unit | Status | Notes |

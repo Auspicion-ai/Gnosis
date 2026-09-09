@@ -15,3 +15,7 @@
 
 # local caches
 .cache/
+
+# archival area (gitignored per the archival-loop convention — obsolete docs,
+# stale test data, findings reports, and historical review records move here)
+archive/
