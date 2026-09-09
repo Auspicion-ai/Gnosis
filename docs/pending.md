@@ -23,6 +23,15 @@ must respect; (b) DEFERRED — lower-value gaps parked until a use case surfaces
 | **F5 — LLM-generated dynamic graph query** | **PARKED** (spec §7.6): gated on a graph-query substrate the suite lacks. |
 | **F6 — RAG evaluation harness** | **SHOULD HAVE dev/QA gate** (spec §7.8): a DeepEval-style offline faithfulness/relevancy/precision-recall gate over the audit-log material; not a runtime contract element. |
 
+## ENGINE-INTERNAL DEFERRED (surfaced by the §4.3 adversarial gate; not spec gaps)
+
+| Item | Disposition |
+| --- | --- |
+| **Fact-store sharding** | `fact_store` is a single global `RwLock` (a de-facto store-wide write serialization point for fact-heavy loads). **DEFERRED:** shard by wiki or fold facts into the document shards; revisit at the §4.5 volume-tuning pass. |
+| **Fact `node_id` coherence** | §4.3.1 says `documentId`/`nodeId` is the fact's location in the store, but the stored `node_id` is a fabricated `fact-{fact_key}` handle, not a live graph `fact` node (a caller `edges_from(.., "fact-lic")` gets `ValidationError`). **DEFERRED:** materialize the graph `fact` node on commit (or drop the location claim) — revisit with the §4.5 retrieval work. |
+| **Engine-side query audit-log recording sink** | `getQueryAuditLog` accessor exists (`Ok(vec![])` until recording lands), but no recording feed yet. **DEFERRED to §4.5:** wire the `ragQuery`/`ragStream` recording sink + audit store so §4.3.4 returns real entries. |
+| **Cross-field consistency gate** | §4.3.2a.1 lists cross-field consistency as a gate check, but a semantic content check needs the §4.5 embedding/entity-resolution leg. **DEFERRED to §4.5:** the §4.3 gate enforces schema/grounding/dedup only; cross-field is explicitly not a runtime §4.3 branch. |
+
 ## SPECULATIVE
 
 _(No Gnosis-specific speculative items yet — the parked layers are recorded in

@@ -5,12 +5,12 @@
 //! (`docs/specs/gnosis.md`) plus the concurrency design plan
 //! (`docs/research/gnosis-data-structures-concurrency-plan.md`).
 //!
-//! The **real persistence logic is intentionally NOT implemented here** — the
-//! `Store` implementation carries only `unimplemented!()` stub bodies. The
-//! Implementer lands the §4.1.3 operations, the §4.1.4 optimistic-concurrency
-//! guard (atomic compare-base-revision → apply → bump under the shard write
-//! lock, per SHARDED-RWLOCK-STORE), and the §4.4 publish/delete gates to make
-//! the red tests go green.
+//! The **real persistence logic is implemented here** (GREEN): the §4.1.3
+//! operations, the §4.1.4 optimistic-concurrency guard (atomic
+//! compare-base-revision → apply → bump under the shard write lock, per
+//! SHARDED-RWLOCK-STORE), the §4.4 publish/delete gates, the §4.2 graph surface,
+//! and the §4.3 fact/citation surface (with the H1 delete-gate fact-citation
+//! check and grounding re-verified under the `fact_store` write lock).
 //!
 //! ## Concurrency contract (from the plan + `docs/decisions.md`)
 //!
@@ -208,7 +208,7 @@ pub struct Wiki {
 }
 
 // ---------------------------------------------------------------------------
-// §4.2 — Knowledge graph: types added by the §4.2 TestWriter (RED-first)
+// §4.2 — Knowledge graph: types added by the §4.2 TestWriter
 //
 // These are the §4.2.5–§4.2.9 surface types. The `Node`/`Edge` graph model
 // (§4.1) is FROZEN — the Implementer must NOT add fields to them (that would
@@ -359,6 +359,115 @@ pub struct ResolveOptions {
     pub wiki_id: WikiId,
     /// Bounded-resolution hop cap; exceeding it → `HopLimitExceeded` (§4.2.6).
     pub max_hops: u64,
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 — Fact/citation tracking surface types (derived from §4.3)
+//
+// These are the §4.3.1–§4.3.4 surface types built on the **frozen** §4.2 `Fact`
+// value (fact_key / value / document_id / node_id / updated_at / citations).
+// The Implementer must NOT add fields to `Fact`.
+// ---------------------------------------------------------------------------
+
+/// `listFacts(wikiId, {state?, page?, pageSize?})` filters (§4.5.4). A `None`
+/// field means "no filter". `page`/`pageSize` are 1-based and bounded (FS-3).
+///
+/// ## TestWriter resolution (spec ambiguity)
+/// The spec's `listFacts` `state?` filter is undocumented and the §4.3.1 `Fact`
+/// value carries **no** own `state` (the spec never defines a `FactState`). The
+/// reasonable reading — consistent with `listDocuments` (§4.1.3), whose `state?`
+/// uses `DocState` — is that the filter matches the state of the **containing
+/// Document** (`DocState`): a fact is included iff its document's state equals
+/// the filter. The Implementer must match exactly this.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListFactsFilter {
+    pub state: Option<DocState>,
+    pub page: Option<u64>,
+    pub page_size: Option<u64>,
+}
+
+/// `listFacts` return shape `{items, total, page, pageSize}` (§4.5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactList {
+    pub items: Vec<Fact>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
+}
+
+/// `updateFact(factKey, {value, citations})` input (§4.3.2). Updates the value +
+/// the (≥1) grounding set. The manual declaration still passes the deterministic
+/// gate (§4.3.2a.3) and refreshes `updatedAt`. Empty `citations` →
+/// `ValidationError` ("fact requires at least one citation").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateFactRequest {
+    pub value: String,
+    pub citations: Vec<(DocumentId, NodeId)>,
+}
+
+/// The **Propose**-stage output (§4.3.2a.1): `{factKey, value, citations}`. A
+/// light LLM (or a manual `createFact`) proposes one of these; the deterministic
+/// gate confirms or rejects it before any commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateFact {
+    pub fact_key: String,
+    pub value: String,
+    pub citations: Vec<(DocumentId, NodeId)>,
+}
+
+/// The machine-actionable rejection reason `{code, field, message}` (§4.3.2a.2):
+/// a structured shape an agent/user can correct and re-submit. `field` names the
+/// offending candidate field (`fact_key`/`value`/`citations`), `code` the exact
+/// check that failed (schema/grounding/dedup/cross-field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rejection {
+    pub code: String,
+    pub field: String,
+    pub message: String,
+}
+
+/// `proposeCandidateFact(wikiId, candidate)` outcome. A **committed** candidate
+/// → `accepted: true` + the `Fact`. A fail-closed rejection → `accepted: false`,
+/// no `fact`, and the machine-actionable `Rejection` — the store has **no partial
+/// commit** (§4.3.2a.2). Fail-states the spec pins as `StoreError` (dangling
+/// citation / duplicate key) surface as `Err`, not as a rejected outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalOutcome {
+    pub accepted: bool,
+    pub fact: Option<Fact>,
+    pub rejection: Option<Rejection>,
+}
+
+/// The RAG query mode — the audit-log `mode` (`'flat'|'graph'|'vector'|'hybrid'`,
+/// §4.3.4 / §4.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueryMode {
+    Flat,
+    Graph,
+    Vector,
+    Hybrid,
+}
+
+/// The `filters` recorded in a query audit-log entry (§4.3.4). Mirrors the pinned
+/// §4.5.2 filters shape; `None` top-level means "no filters" (the log's `null`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryAuditFilters {
+    pub node_kind: Option<NodeKind>,
+    pub edge_type: Option<EdgeKind>,
+    pub target: Option<(DocumentId, NodeId)>,
+    pub state: Option<ReferenceState>,
+}
+
+/// A single query audit-log entry (§4.3.4):
+/// `{query, filters, mode, resultCount, timestamp, requester}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryAuditEntry {
+    pub query: String,
+    pub filters: Option<QueryAuditFilters>,
+    pub mode: QueryMode,
+    pub result_count: u64,
+    pub timestamp: String,
+    pub requester: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,12 +681,10 @@ pub trait RagStore: Send + Sync {
     fn list_wikis(&self) -> impl Future<Output = Result<Vec<Wiki>, StoreError>> + Send;
 
     // -----------------------------------------------------------------------
-    // §4.2 — Knowledge-graph surface (added by the §4.2 TestWriter, RED-first)
+    // §4.2 — Knowledge-graph surface (added by the §4.2 TestWriter, GREEN now).
     //
-    // Every method is a **stub** (`unimplemented!()` in `Store`): the crate
-    // compiles, the tests load, and every §4.2 assertion fails at runtime. The
-    // Implementer replaces these bodies with the real graph logic. Exact
-    // signatures/return shapes/fail-states follow §4.2.5–§4.2.9.
+    // Implemented in `Store`. Exact signatures/return shapes/fail-states follow
+    // §4.2.5–§4.2.9.
     // -----------------------------------------------------------------------
 
     /// `edgesFrom(documentId, nodeId) → Edge[]` (§4.2.5). All edges whose source
@@ -723,8 +830,7 @@ pub trait RagStore: Send + Sync {
     /// the canonical entity `(docId, nodeId)` for a resolved alias, or `None`
     /// when the alias has no recorded resolution. Added by the TestWriter so the
     /// CRITICAL #2 regression (resolveEntities must *persist*, not just return a
-    /// descriptor) can read the mapping back. RED today: the Store body is a
-    /// stub the Implementer must fill.
+    /// descriptor) can read the mapping back. GREEN — implemented in `Store`.
     fn entity_alias_canonical(
         &self,
         alias: &(DocumentId, NodeId),
@@ -747,8 +853,9 @@ pub trait RagStore: Send + Sync {
     /// store (§4.3.1). Added so the CRITICAL #1 regression (mergeFacts must
     /// *persist* the merged fact — union citations + refreshed `updatedAt`,
     /// journaled — not merely return a descriptor) can read the merge back.
-    /// Failures: `ValidationError` (no such fact). RED today: the Store body is
-    /// a stub the Implementer must fill.
+    /// Failures: `ValidationError` (empty/whitespace fact key); `WikiNotFound`
+    /// (unknown wiki, FS-2); `DocumentNotFound` (no such fact). GREEN — implemented
+    /// in `Store`.
     fn get_fact(
         &self,
         wiki_id: &WikiId,
@@ -770,17 +877,66 @@ pub trait RagStore: Send + Sync {
         value: &str,
         citations: &[(DocumentId, NodeId)],
     ) -> impl Future<Output = Result<Fact, StoreError>> + Send;
+
+    // -----------------------------------------------------------------------
+    // §4.3 — Fact/citation tracking surface (added by the §4.3 TestWriter,
+    // GREEN now; derived from §4.3.1–§4.3.4 and implemented in `Store`).
+    // -----------------------------------------------------------------------
+
+    /// `listFacts(wikiId, {state?, page?, pageSize?}) → {items, total, page,
+    /// pageSize}` (§4.5.4). Paginated list of `Fact` nodes. Failures:
+    /// `WikiNotFound` (FS-2); `ValidationError` (`page < 1`, `pageSize < 1`,
+    /// `pageSize > 100`).
+    fn list_facts(
+        &self,
+        wiki_id: &WikiId,
+        filter: &ListFactsFilter,
+    ) -> impl Future<Output = Result<FactList, StoreError>> + Send;
+
+    /// `updateFact(factKey, {value, citations}) → Fact` (§4.3.2) — updates a
+    /// stored fact's `value` + `citations`; the manual declaration still passes
+    /// the deterministic gate (§4.3.2a.3). Failures: `DocumentNotFound` (unknown
+    /// fact); `ValidationError` (empty `citations` — the §4.3.2 minimum-citation
+    /// invariant, "fact requires at least one citation"; and a dangling citation
+    /// → "citation does not resolve").
+    fn update_fact(
+        &self,
+        wiki_id: &WikiId,
+        fact_key: &str,
+        request: &UpdateFactRequest,
+    ) -> impl Future<Output = Result<Fact, StoreError>> + Send;
+
+    /// `proposeCandidateFact(wikiId, candidate) → ProposalOutcome` (§4.3.2a) —
+    /// the deterministic validation gate. Runs the fail-closed checks (schema
+    /// conformance, grounding/provenance, dedup/conflict, cross-field
+    /// consistency) and, on a pass, **commits** the fact (`accepted: true` +
+    /// `fact`). On a fail it returns `accepted: false` with a machine-actionable
+    /// `{code, field, message}` `Rejection` and commits **nothing** (no partial
+    /// commit, §4.3.2a.2). Fail-states the spec pins in §4.3.2a.4 surface as
+    /// `StoreError`: a dangling citation → `ValidationError` ("citation does not
+    /// resolve"); a duplicate `factKey` → `ConflictError` (or routed to entity
+    /// resolution).
+    fn propose_candidate_fact(
+        &self,
+        wiki_id: &WikiId,
+        candidate: &CandidateFact,
+    ) -> impl Future<Output = Result<ProposalOutcome, StoreError>> + Send;
+
+    /// `getQueryAuditLog() → QueryAuditEntry[]` (§4.3.4). Returns the engine-side
+    /// audit log — every `ragQuery`/`ragStream` call as `{query, filters, mode,
+    /// resultCount, timestamp, requester}`. The **recording** is engine-side
+    /// (§4.3.4) and fed by the §4.5 query path; this accessor is the reachable
+    /// surface now.
+    fn get_query_audit_log(
+        &self,
+    ) -> impl Future<Output = Result<Vec<QueryAuditEntry>, StoreError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
-// Stub implementation — the RED state.
-//
-// All §4.1.3 operations are `unimplemented!()`: the crate compiles, every test
-// loads, and every behavior assertion fails at runtime. The Implementer replaces
-// these bodies with the real §4.1 logic (sharded RwLock store, optimistic
-// concurrency under the shard write lock, publish gate, delete integrity gate,
-// pagination + validation) — the red tests are the executable contract.
-// ---------------------------------------------------------------------------
+// Store implementation — GREEN (the §4.1/§4.2/§4.3/§4.4 behavior is implemented:
+// sharded RwLock store, optimistic concurrency under the shard write lock,
+// publish gate, delete integrity gate — including the §4.3 fact-citation check —
+// and the §4.3 fact/citation surface).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1110,6 +1266,15 @@ impl Store {
             .map(|s| s.contains(node_id))
             .unwrap_or(false)
     }
+
+    /// The containing document's `DocState` for a fact (`None` if the document
+    /// no longer exists). Used by `list_facts`' §4.5.4 `state?` filter: a fact is
+    /// included iff its document's state equals the filter (§4.1.3-consistent
+    /// reading of the undocumented filter).
+    fn doc_state(&self, document_id: &DocumentId) -> Option<DocState> {
+        let guard = self.shard_for(document_id).read().unwrap();
+        guard.docs.get(document_id).map(|d| d.state)
+    }
 }
 
 impl Default for Store {
@@ -1282,6 +1447,24 @@ impl RagStore for Store {
                         EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
                     ) && &edge.target.0 == document_id
                     {
+                        return Err(StoreError::DocumentInUse);
+                    }
+                }
+            }
+        }
+        // §4.4.5 fact-citation integrity gate (H1): a **committed** fact whose
+        // `citations` reference a node of this document blocks deletion (a delete
+        // must never leave a dangling fact citation). This scan runs inside the
+        // store-wide integrity `write` lock, and the fact-commit paths
+        // (`create_fact`/`update_fact`/`propose_candidate_fact`) take that same
+        // lock as `read()` for their entire ground+commit critical section, so no
+        // citing fact can be grounded/committed between this scan and the removal
+        // below — there is no dangling-citation TOCTOU.
+        {
+            let facts = self.fact_store.read().unwrap();
+            for by_key in facts.values() {
+                for f in by_key.values() {
+                    if f.citations.iter().any(|(cdoc, _)| cdoc == document_id) {
                         return Err(StoreError::DocumentInUse);
                     }
                 }
@@ -1484,13 +1667,10 @@ impl RagStore for Store {
     }
 
     // -----------------------------------------------------------------------
-    // §4.2 stub bodies — the RED state.
+    // §4.2 — graph surface (GREEN).
     //
-    // Every §4.2 operation is `unimplemented!()`: the crate compiles, every test
-    // loads, and every §4.2 behavior assertion fails at runtime (the executable
-    // contract is `tests/graph_integration.rs`). The Implementer replaces these
-    // bodies with the real §4.2 logic. They must NOT add fields to the frozen
-    // `Node`/`Edge` types (§4.1).
+    // Implemented in `Store` (§4.2.5–§4.2.9, GRAPH-OWNS-RELATION-AND-MERGE).
+    // They must NOT add fields to the frozen `Node`/`Edge` types (§4.1).
     // -----------------------------------------------------------------------
 
     async fn edges_from(
@@ -2159,9 +2339,14 @@ impl RagStore for Store {
     }
 
     async fn get_fact(&self, wiki_id: &WikiId, fact_key: &str) -> Result<Fact, StoreError> {
+        // H5 (FS-2): an unknown `wikiId` is `WikiNotFound`, checked up front before
+        // any other validation — uniformly across the whole fact surface.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
         // CRITICAL #1 read-back: empty `factKey` → `ValidationError`; a missing
         // fact → `DocumentNotFound` (§4.2.9.1), never a misleading citation error.
-        if fact_key.is_empty() {
+        if fact_key.trim().is_empty() {
             return Err(StoreError::ValidationError(
                 "fact key must be non-empty".into(),
             ));
@@ -2172,13 +2357,7 @@ impl RagStore for Store {
             .get(wiki_id)
             .and_then(|by_key| by_key.get(fact_key))
             .cloned()
-            .ok_or_else(|| {
-                if !self.wikis.read().unwrap().contains_key(wiki_id) {
-                    StoreError::ValidationError("unknown wiki".into())
-                } else {
-                    StoreError::DocumentNotFound
-                }
-            })
+            .ok_or(StoreError::DocumentNotFound)
     }
 
     async fn create_fact(
@@ -2189,7 +2368,14 @@ impl RagStore for Store {
         value: &str,
         citations: &[(DocumentId, NodeId)],
     ) -> Result<Fact, StoreError> {
-        if fact_key.is_empty() || value.is_empty() {
+        // H5 (FS-2): an unknown `wikiId` is `WikiNotFound`, checked up front — a
+        // fact must never be committed into a nonexistent wiki.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        // H4 (§4.3.2a.1): whitespace-only `factKey`/`value` are schema-conformance
+        // failures — trim before `is_empty`.
+        if fact_key.trim().is_empty() || value.trim().is_empty() {
             return Err(StoreError::ValidationError(
                 "fact key and value must be non-empty".into(),
             ));
@@ -2200,12 +2386,25 @@ impl RagStore for Store {
                 "fact requires at least one citation".into(),
             ));
         }
+        // Grounding + uniqueness + commit are atomic under the store-wide
+        // integrity `read` lock (a concurrent `delete_document` holds the `write`
+        // side, so it cannot interleave), and the grounding is **re-verified**
+        // inside the `fact_store.write()` critical section (H1 TOCTOU: a
+        // concurrent delete cannot leave a dangling citation between the
+        // pre-lock shard reads and the commit). Lock order `reference_lock →
+        // shard → fact_store` matches every other mutation → no deadlock.
+        let _integrity = self.reference_lock.read().unwrap();
         // Grounding: every citation resolves to a real node (fail-closed §4.3.2a.2).
         for (cdoc, cnode) in citations {
             self.read_node(cdoc, cnode)?;
         }
         // §4.3.1: factKey unique within the Wiki.
         let mut facts = self.fact_store.write().unwrap();
+        // H1 TOCTOU guard: re-verify every citation still resolves to a real node
+        // inside the same write critical section that commits the fact.
+        for (cdoc, cnode) in citations {
+            self.read_node(cdoc, cnode)?;
+        }
         let by_key = facts.entry(wiki_id.clone()).or_default();
         if by_key.contains_key(fact_key) {
             return Err(StoreError::ConflictError);
@@ -2228,6 +2427,267 @@ impl RagStore for Store {
         drop(facts);
         self.append_journal("create_fact", 0);
         Ok(fact)
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.3 — fact/citation surface (GREEN).
+    //
+    // These operations are implemented (not RED stubs) and must NOT add fields
+    // to the frozen `Fact` value type. The §4.3.2a.2 deterministic gate and the
+    // §4.3.1 wiki-unique `factKey` invariant are enforced here, with grounding
+    // re-verified under the `fact_store` write lock (H1) so a concurrent
+    // `delete_document` cannot leave a dangling citation.
+    // -----------------------------------------------------------------------
+
+    async fn list_facts(
+        &self,
+        wiki_id: &WikiId,
+        filter: &ListFactsFilter,
+    ) -> Result<FactList, StoreError> {
+        // FS-2 (§4.5.4): listFacts on an unknown `wikiId` → `WikiNotFound`.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        let page = filter.page.unwrap_or(1);
+        let page_size = filter.page_size.unwrap_or(20);
+        // FS-3 (§4.5.4): page<1 / pageSize<1 / pageSize>100 → `ValidationError`.
+        if page < 1 || !(1..=100).contains(&page_size) {
+            return Err(StoreError::ValidationError(
+                "page must be >= 1 and page_size must be in 1..=100".into(),
+            ));
+        }
+        let facts = self.fact_store.read().unwrap();
+        let by_key = match facts.get(wiki_id) {
+            Some(m) => m,
+            None => {
+                return Ok(FactList {
+                    items: vec![],
+                    total: 0,
+                    page,
+                    page_size,
+                })
+            }
+        };
+        // §4.5.4 `state?` filter (TestWriter resolution): the state of the fact's
+        // **containing Document** (`DocState`). An unfiltered `None` matches all.
+        let mut matched: Vec<Fact> = Vec::new();
+        for f in by_key.values() {
+            if let Some(state) = filter.state {
+                if self.doc_state(&f.document_id) != Some(state) {
+                    continue;
+                }
+            }
+            matched.push(f.clone());
+        }
+        // Deterministic pagination ordering (§4.5.4 paginates a table).
+        matched.sort_by(|a, b| a.fact_key.cmp(&b.fact_key));
+        let total = matched.len();
+        let start = (page as usize - 1).saturating_mul(page_size as usize);
+        if start >= total {
+            return Ok(FactList {
+                items: vec![],
+                total: total as u64,
+                page,
+                page_size,
+            });
+        }
+        let end = (start + page_size as usize).min(total);
+        Ok(FactList {
+            items: matched[start..end].to_vec(),
+            total: total as u64,
+            page,
+            page_size,
+        })
+    }
+
+    async fn update_fact(
+        &self,
+        wiki_id: &WikiId,
+        fact_key: &str,
+        request: &UpdateFactRequest,
+    ) -> Result<Fact, StoreError> {
+        // H5 (FS-2): an unknown `wikiId` is `WikiNotFound`, checked up front.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        // H2 (§4.3.2a.1): an empty or whitespace-only `value` is a schema
+        // conformance failure — reject before applying.
+        if request.value.trim().is_empty() {
+            return Err(StoreError::ValidationError(
+                "fact value must be non-empty".into(),
+            ));
+        }
+        // §4.3.2 minimum-citation invariant — empty `citations` is a
+        // `ValidationError` regardless of the fact's existence.
+        if request.citations.is_empty() {
+            return Err(StoreError::ValidationError(
+                "fact requires at least one citation".into(),
+            ));
+        }
+        // Grounding + apply are atomic under the integrity `read` lock (a
+        // concurrent `delete_document` holds the `write` side), and grounding is
+        // **re-verified** inside the `fact_store.write()` critical section (H1
+        // TOCTOU guard — a concurrent delete cannot leave a dangling citation).
+        let _integrity = self.reference_lock.read().unwrap();
+        // Grounding (§4.3.2a.2): every citation must resolve to a real node.
+        for (cdoc, cnode) in &request.citations {
+            if self.read_node(cdoc, cnode).is_err() {
+                return Err(StoreError::ValidationError(
+                    "citation does not resolve".into(),
+                ));
+            }
+        }
+        // Unknown fact → `DocumentNotFound` (§4.3.2). Compare-then-apply under the
+        // `fact_store` write lock so the update is atomic with the existence check.
+        let mut facts = self.fact_store.write().unwrap();
+        // H1 TOCTOU guard: re-verify every citation still resolves under the write
+        // lock that applies the update.
+        for (cdoc, cnode) in &request.citations {
+            if self.read_node(cdoc, cnode).is_err() {
+                return Err(StoreError::ValidationError(
+                    "citation does not resolve".into(),
+                ));
+            }
+        }
+        let by_key = match facts.get_mut(wiki_id) {
+            Some(m) => m,
+            None => return Err(StoreError::DocumentNotFound),
+        };
+        let existing = match by_key.get_mut(fact_key) {
+            Some(f) => f,
+            None => return Err(StoreError::DocumentNotFound),
+        };
+        // Dedupe citations by first appearance (§4.3.2 grounding set).
+        let mut deduped: Vec<(DocumentId, NodeId)> = Vec::new();
+        for c in request.citations.iter() {
+            if !deduped.contains(c) {
+                deduped.push(c.clone());
+            }
+        }
+        existing.value = request.value.clone();
+        existing.citations = deduped;
+        existing.updated_at = iso_now();
+        let updated = existing.clone();
+        drop(facts);
+        self.append_journal("update_fact", 0);
+        Ok(updated)
+    }
+
+    async fn propose_candidate_fact(
+        &self,
+        wiki_id: &WikiId,
+        candidate: &CandidateFact,
+    ) -> Result<ProposalOutcome, StoreError> {
+        // H5 (FS-2): an unknown `wikiId` is `WikiNotFound`, checked up front — a
+        // candidate is never committed into a nonexistent wiki.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        // §4.3.2a.2 deterministic fail-closed validation gate. Schema-conformance
+        // failures (other than those the spec pins as `StoreError`) return
+        // `accepted:false` + a machine-actionable `Rejection` and commit nothing.
+        // H4: whitespace-only `factKey`/`value` are schema failures — trim first.
+        if candidate.fact_key.trim().is_empty() {
+            return Ok(rejected_outcome(
+                "schema",
+                "fact_key",
+                "fact key must be non-empty",
+            ));
+        }
+        if candidate.value.trim().is_empty() {
+            return Ok(rejected_outcome(
+                "schema",
+                "value",
+                "fact value must be non-empty",
+            ));
+        }
+        // §4.3.2 minimum-citation invariant (empty `citations`).
+        if candidate.citations.is_empty() {
+            return Ok(rejected_outcome(
+                "schema",
+                "citations",
+                "fact requires at least one citation",
+            ));
+        }
+        // Grounding + commit are atomic under the integrity `read` lock (a
+        // concurrent `delete_document` holds the `write` side), and grounding is
+        // **re-verified** inside the `fact_store.write()` critical section (H1
+        // TOCTOU — a concurrent delete cannot leave a dangling citation).
+        let _integrity = self.reference_lock.read().unwrap();
+        // Grounding/provenance (§4.3.2a.4): a dangling citation → `Err`
+        // `ValidationError("citation does not resolve")`, nothing committed.
+        for (cdoc, cnode) in &candidate.citations {
+            if self.read_node(cdoc, cnode).is_err() {
+                return Err(StoreError::ValidationError(
+                    "citation does not resolve".into(),
+                ));
+            }
+        }
+        // The commit — compare-then-insert under the `fact_store` write lock
+        // (atomic vs. concurrent same-key candidates; §4.3.2a.4 duplicate key →
+        // `ConflictError`; no partial commit). The whole gate above ran before
+        // any write, so a rejected candidate leaves the store untouched.
+        let mut facts = self.fact_store.write().unwrap();
+        // H1 TOCTOU guard: re-verify every citation still resolves under the write
+        // lock that commits the fact.
+        for (cdoc, cnode) in &candidate.citations {
+            if self.read_node(cdoc, cnode).is_err() {
+                return Err(StoreError::ValidationError(
+                    "citation does not resolve".into(),
+                ));
+            }
+        }
+        let by_key = facts.entry(wiki_id.clone()).or_default();
+        if by_key.contains_key(&candidate.fact_key) {
+            return Err(StoreError::ConflictError);
+        }
+        // Dedupe citations by first appearance (§4.3.2 grounding set).
+        let mut deduped: Vec<(DocumentId, NodeId)> = Vec::new();
+        for c in candidate.citations.iter() {
+            if !deduped.contains(c) {
+                deduped.push(c.clone());
+            }
+        }
+        let fact = Fact {
+            fact_key: candidate.fact_key.clone(),
+            value: candidate.value.clone(),
+            // The fact belongs to the document its first citation grounds in.
+            document_id: candidate.citations[0].0.clone(),
+            node_id: NodeId(format!("fact-{}", candidate.fact_key)),
+            updated_at: iso_now(),
+            citations: deduped,
+        };
+        by_key.insert(candidate.fact_key.clone(), fact.clone());
+        drop(facts);
+        self.append_journal("propose_candidate_fact", 0);
+        Ok(ProposalOutcome {
+            accepted: true,
+            fact: Some(fact),
+            rejection: None,
+        })
+    }
+
+    async fn get_query_audit_log(&self) -> Result<Vec<QueryAuditEntry>, StoreError> {
+        // §4.3.4 accessor. The `[{query, filters, mode, resultCount, timestamp,
+        // requester}]` recording is engine-side and fed by the (not-yet-built)
+        // §4.5 query path; for §4.3 the accessor is reachable and returns the
+        // recorded entries (empty on a fresh store).
+        Ok(Vec::new())
+    }
+}
+
+/// The machine-actionable fail-closed rejection `{code, field, message}`
+/// (§4.3.2a.2) for a schema-conformance gate failure. `field` names the
+/// offending candidate field; `code` the exact check that failed.
+fn rejected_outcome(code: &str, field: &str, message: &str) -> ProposalOutcome {
+    ProposalOutcome {
+        accepted: false,
+        fact: None,
+        rejection: Some(Rejection {
+            code: code.to_string(),
+            field: field.to_string(),
+            message: message.to_string(),
+        }),
     }
 }
 
