@@ -16,6 +16,10 @@
 # local caches
 .cache/
 
+# sandbox-local cargo home (used to run the trio when the global ~/.cargo write
+# is blocked by the file sandbox; see docs for how to rebuild)
+.cargo-home/
+
 # archival area (gitignored per the archival-loop convention — obsolete docs,
 # stale test data, findings reports, and historical review records move here)
 archive/

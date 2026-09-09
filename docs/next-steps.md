@@ -11,15 +11,37 @@ contract is `docs/specs/gnosis.md`.
 
 ## CURRENT WORK / handover-state
 
-**Handover state (current): the core engine is fully implemented.** §4.1–§4.6 are
-all DONE (see the DONE rows below) and adversarially hardened — **233 green tests**
-(store 50 [incl. the §4.1.1 `doc_state_legal_transitions` state-machine test] +
-graph 66 + facts 36 + consistency 22 + rag_query 34 + retrieval_stack 18 +
-agent_memory 6 + the `tests/integration.rs` placeholder `scaffold_compiles` 1) —
-with `build`/`clippy`/`fmt` clean. The **only OPEN unit is the §4.6.1/§5.1 F2 engine seam** (the concrete
+**Handover state (current): the core engine is fully implemented AND the
+mandatory PBT gate is retrofitted to every code-bearing unit.** §4.1–§4.6 are all
+DONE (see the DONE rows below) and adversarially hardened — **293 green tests**
+(store 50 + graph 66 + facts 36 + consistency 22 + rag_query 34 +
+retrieval_stack 19 [incl. the §4.5 `rrf_fuse` outer-order-independence
+regression] + agent_memory 6 + the `tests/integration.rs` placeholder
+`scaffold_compiles` 1 + the 5 PBT property suites `props_{store 12, graph 13,
+facts 14, consistency 12, retrieval 8}` = 59) — with `build`/`clippy`/`fmt`
+clean. The **only OPEN unit is the §4.6.1/§5.1 F2 engine seam** (the concrete
 IPC/HTTP transport between the shell and Gnosis over the `RagStore` +
 `ragQuery`/`ragStream`/`engine-status` interface). The dated entries below are the
 historical scaffold→implemented record.
+
+**PBT-GATE RETROFIT (2026-09-09, decision PBT-GATE-MANDATORY):** the mandatory
+property-based-testing gate now applies to every code-bearing unit. Five typed
+property registers (`docs/specs/4-*-property-register.md`, P-IM/P-SM/P-TP ≤8 rows
+each), five executed property layers (`tests/props_*.rs`, each a deterministic
+hand-rolled SplitMix64/Xoshiro PRNG with a pinned seed, ≤100 generated
+cases/row, ≤400 total, stop-after-5, HELD/BROKEN + strategy-id), and five read-only
+PBT audits landed. Register rows are invariants-only (never §6/FS-n or §7/F-gap
+rows), each TRUE of the green implementation. Result: **39 of 40 property rows
+HELD**; the gate surfaced and host-fixed a **genuine defect** — `rrf_fuse`'s f64
+RRF accumulation was non-associative so exact-tied keys landed 1 ULP apart by
+input-list order, breaking §4.5.3 exact-merge determinism (register P-IM-2);
+fixed (canonical sorted order of per-key contributions) + regression test in
+`tests/retrieval_stack_integration.rs`. Negative-generator probes added from the
+audits across all 5 units; the §4.3 register's stale `[PENDING]` tags were
+re-tagged GREEN (those defects were already fixed). Two engine-internal
+non-goals/behaviours recorded: the §4.4 `publish_document` concurrent-atomicity
+TOCTOU (defects.md + HANDOFF.md) and the §4.2 `resolve_entities` residual-alias
+behaviour (defects.md + pending.md).
 
 **Scaffold (2026-09-09): the project is scaffolded.** The folder structure, the
 canonical spec (`docs/specs/gnosis.md`, copied from the Auspicion Suite), the
@@ -102,6 +124,7 @@ parked (`docs/pending.md`), FS-13/14/15 lexical-index tension in `docs/HANDOFF.m
 
 | Unit | Red set | Green | Adversarial findings | Blind-greens | Doc-review | Trio |
 | --- | --- | --- | --- | --- | --- | --- |
+| **PBT-gate retrofit** (all code-bearing units, decision PBT-GATE-MANDATORY) | TestWriter red: §4.1–§4.4 + §4.5 property layers all **HELD** (40 rows); **§4.5 P-IM-2 genuinely BROKEN** (`rrf_fuse` f64 RRF accumulation non-associative → exact ties land 1 ULP apart by input order, defeating the id-ascending §4.5.3 tie-break) → host-fixed | **40/40 property rows HELD** after the `rrf_fuse` host fix (5 suites: props_store 12, props_graph 13, props_facts 14, props_consistency 12, props_retrieval 8) + negative-generator probes + 1 `rrf_fuse` regression (retrieval_stack 18→19) | 5 read-only PBT audits. **§4.5 P-IM-2 = genuine host defect (fixed + regression-pinned);** register re-scopes (store P-IM-1/P-SM-1/P-SM-2 monotonic-id + annotation-reconcile; graph P-TP-2 same-call idempotence + residual-alias; consistency P-IM-3/P-TP-2/P-SM-1/P-SM-3 scoping); §4.3 stale `[PENDING]` tags re-tagged GREEN (already-fixed defects); negative-generator probes added; **2 engine-internal items recorded**: §4.4 `publish_document` concurrent-atomicity TOCTOU non-goal (defects.md + HANDOFF.md), §4.2 `resolve_entities` residual-alias behaviour (defects.md + pending.md) | N/A (property-layer gates, not UI scenario) | proofreader applied all register/tracker corrections; test count reconciled to **293** (the archived doc-review's 234 overcount was itself wrong — actual baseline was 233) | `cargo test` **293 pass, 0 fail** · `build` clean · `clippy` 0 warnings · `fmt` clean |
 | **§4.1 document store** (spec §4.1) | TestWriter red: **41 red + 1 green** at the compile-with-stubs stage; after the red-set fixture corrections, the implementer landed **42/42**, then the adversarial regression set added **8 tests** (5 red) → **50/50** | 50/50 (`tests/store_integration.rs`) + placeholder 1 | **HIGH** out-of-range pagination panic (fixed: clamp/overflow-safe); **MEDIUM** delete TOCTOU dangling-reference (fixed: store-wide `reference_integrity` `RwLock`); **MEDIUM** crosslink `Broken`/`Stale` not gated on publish (fixed); **MEDIUM** fabricated reference state trusted (fixed: derive state from target existence, skip cross-wiki); **MEDIUM** WRITER-ACTOR-JOURNAL not honored (fixed: minimal mutation journal + epoch feed); concurrency tests single-threaded false security (fixed: multi-threaded + Barrier); plus low/`unwrap`/ordering notes | pending (documentation gates) | pending (documentation gates) | `cargo test` 51 pass (store 50 + placeholder 1) · `build` clean · `clippy` clean · `fmt` clean |
 | **§4.2 knowledge graph** (spec §4.2) | TestWriter red: **55 red** at the stubs stage; after the §4.2 adversarial gate, **10 regression tests** pinned the CRITICAL/HIGH findings (rejected first green) → **66/66** after the graph-owned type evolution + a `max_hops` spec-conflict rebase | 66/66 (`tests/graph_integration.rs`) + store 50 + placeholder 1 | §4.2 adversarial rejected the first green. **CRITICAL (all fixed + regression-pinned):** triple `relationType` lived in a sidecar, not the graph (§4.2.7.2 — fixed via decided type evolution, `Edge.relation_type`); triple cascade only masked, leaving a `triple_store` second-source-of-truth and duplicate-on-re-add (fixed: prune relation edges on node delete + derive membership from the graph); `merge_facts` computed but never persisted (fixed: write back union citations + `updated_at` + journal + `get_fact`); `resolve_entities` had no durable effect (fixed: journaled alias→canonical `entity_resolution` + `entity_alias_canonical`). **HIGH:** `set_reference_state` whole-graph clobber + no reference-lock/optimistic compare (fixed: targeted edge-state mutation under `reference_lock` + revision-aware reconcile so concurrent updates don't lose data); `resolve_references` unbounded `max_hops` + ignored wiki (fixed: validate 1–5 → `ValidationError`, unknown wiki → `WikiNotFound`); `add_triple`/`get_triples` unknown wiki (fixed). **SPEC-CONFLICT:** three `resolve_references` tests used `max_hops:10` outside the pinned 1–5 — rebased to `2` (still ≥ chain length). **HANDOFF (upstream):** spec §4.2.9.1/§4.2.7.2/`resolveEntities` result-shape should be reconciled to match the graph-owned realization | pending (documentation gates) | pending (documentation gates) | `cargo test` 117 pass (graph 66 + store 50 + placeholder 1) · `build` clean · `clippy` clean · `fmt` clean |
 | **§4.3 fact/citation tracking** (spec §4.3) | TestWriter red: **18 red + 6 green guards** at the stubs stage; after the §4.3 adversarial gate, **11 regression tests** pinned the findings → **36/36** | 36/36 (`tests/facts_integration.rs`) + graph 66 + store 50 + placeholder 1 | **HIGH:** delete gate didn't block/prune fact citations → dangling citations + a commit-time grounding TOCTOU (fixed: delete gate scans `fact_store` → `DocumentInUse`; fact commits take `reference_lock.read()` + re-verify grounding inside `fact_store.write()`). **MEDIUM:** `update_fact` accepted empty/whitespace value (fixed: trim→`ValidationError`); whitespace-only key/value passed schema conformance (fixed: trim before `is_empty` in gate + `create_fact`); inconsistent/absent unknown-wiki on the fact surface (fixed: `WikiNotFound` up front on `create_fact`/`update_fact`/`propose_candidate_fact`/`get_fact`); **cross-field consistency** doc mismatch — declared deferred to §4.5 (needs the embedding leg), test header corrected (not faked). **DEFERRED (pending):** fact-store sharding (single global `RwLock` → shard by wiki later); fact `node_id` is a store handle not a live graph node (reconcile by materializing graph `fact` nodes or dropping the claim); engine-side query **audit-log recording sink** (the `getQueryAuditLog` accessor exists; the recording feed lands in §4.5). **NIT/comment:** stale RED headers corrected | pending (documentation gates) | pending (documentation gates) | `cargo test` 153 pass (facts 36 + graph 66 + store 50 + placeholder 1) · `build` clean · `clippy` clean · `fmt` clean |

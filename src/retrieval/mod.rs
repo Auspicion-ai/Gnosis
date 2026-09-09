@@ -27,15 +27,34 @@ pub const RRF_K: f64 = 60.0;
 /// ## GREEN
 /// Implemented to the pinned EXACT rule (§4.5.3): each item's score is the sum
 /// over lists of `1/(k + rank)`, merged descending by score with ties broken by
-/// `(documentId, nodeId)` ascending, truncated to `top_k`.
+/// `(documentId, nodeId)` ascending, truncated to `top_k`, **and made
+/// outer-order independent**: FP addition is commutative but NOT associative, so
+/// accumulating a key's score in outer-list order can leave two mathematically
+/// equal scores (exact ties) 1 ULP apart, flipping the id-ascending tie-break.
+/// To make the score a pure function of each key's multiset of contributions, we
+/// collect the contributions per key and sum **each key's own contributions in a
+/// canonical (ascending-sorted) order**, so two keys with the same multiset
+/// compute byte-identical floats and exact ties are genuinely detected.
 pub fn rrf_fuse(lists: &[Vec<(DocumentId, NodeId)>], top_k: usize) -> Vec<(DocumentId, NodeId)> {
-    // Accumulate RRF(d) = Σ 1/(k + rank) over every list, 1-based rank = position+1.
-    let mut scores: HashMap<(DocumentId, NodeId), f64> = HashMap::new();
+    // Collect each key's individual RRF contributions 1/(k + rank), 1-based rank
+    // = position + 1, so the final sum is a pure function of its contribution
+    // multiset (independent of which outer lists/ranks produced them).
+    let mut contribs: HashMap<(DocumentId, NodeId), Vec<f64>> = HashMap::new();
     for list in lists {
         for (idx, item) in list.iter().enumerate() {
             let rank = (idx as f64) + 1.0;
-            *scores.entry(item.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
+            contribs
+                .entry(item.clone())
+                .or_default()
+                .push(1.0 / (RRF_K + rank));
         }
+    }
+    // Sum each key's own contributions in a canonical ascending-sorted order, so
+    // identical multisets compute byte-identical floats (outer-order independent).
+    let mut scores: HashMap<(DocumentId, NodeId), f64> = HashMap::new();
+    for (key, mut cs) in contribs {
+        cs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        scores.insert(key, cs.iter().fold(0.0, |acc, c| acc + c));
     }
     // Descending by score; ties broken by (documentId, nodeId) ascending.
     let mut ranked: Vec<((DocumentId, NodeId), f64)> = scores.into_iter().collect();

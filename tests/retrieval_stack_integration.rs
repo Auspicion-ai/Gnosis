@@ -984,3 +984,62 @@ async fn rag_query_filters_restrict_retrieved_nodes_by_node_kind() {
         .unwrap();
     assert!(!res.results.is_empty());
 }
+
+/// §4.5.3 / P-IM-2 regression (PBT gate). `rrf_fuse` must be OUTER-ORDER
+/// INDEPENDENT. FP addition is commutative but NOT associative — accumulating a
+/// key's RRF score in outer-list order can leave two mathematically-identical
+/// scores (exact ties) 1 ULP apart, so the `(documentId, nodeId)`-ascending
+/// tie-break never fires and the order flips with the ORDER of the input lists.
+/// In this shrunk counterexample `(d0,n0)` and `(d1,n1)` both receive the same
+/// contribution multiset `{1/61, 1/61, 1/63}` (an exact tie) but via different
+/// outer-list accumulations. Both must land id-ascending, and the merged
+/// ordering must be identical under every outer permutation.
+#[test]
+fn rrf_fuse_is_outer_order_independent_and_breaks_exact_ties_by_id() {
+    use gnosis::rrf_fuse;
+    let did = |s: &str| DocumentId(s.to_string());
+
+    let a = vec![
+        (did("d0"), nid("n0")),
+        (did("d1"), nid("n0")),
+        (did("d1"), nid("n1")),
+    ];
+    let b = vec![(did("d1"), nid("n1"))];
+    let c = vec![
+        (did("d0"), nid("n0")),
+        (did("d1"), nid("n2")),
+        (did("d0"), nid("n0")),
+    ];
+    let d = vec![(did("d1"), nid("n1"))];
+    let lists = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+
+    // Descending RRF; exact ties by (documentId, nodeId) ascending.
+    // (d0,n0): 2/61 + 1/63 ; (d1,n1): 1/63 + 1/61 + 1/61 — EXACT tie, doc-asc.
+    // (d1,n0): 1/62      ; (d1,n2): 1/62                    — EXACT tie, node-asc.
+    let expected = vec![
+        (did("d0"), nid("n0")),
+        (did("d1"), nid("n1")),
+        (did("d1"), nid("n0")),
+        (did("d1"), nid("n2")),
+    ];
+
+    let base = rrf_fuse(&lists, 10);
+    assert_eq!(
+        base, expected,
+        "the exact-tie (d0,n0)/(d1,n1) keys must land id-ascending regardless of outer-list order"
+    );
+
+    // Several outer permutations must yield the IDENTICAL merged ordering.
+    for perm in [
+        vec![b.clone(), d.clone(), a.clone(), c.clone()],
+        vec![c.clone(), d.clone(), b.clone(), a.clone()],
+        vec![d.clone(), c.clone(), a.clone(), b.clone()],
+        vec![d.clone(), b.clone(), c.clone(), a.clone()],
+    ] {
+        assert_eq!(
+            rrf_fuse(&perm, 10),
+            expected,
+            "rrf_fuse must be OUTER-ORDER INDEPENDENT (P-IM-2)"
+        );
+    }
+}
