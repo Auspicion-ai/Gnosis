@@ -1,6 +1,8 @@
 # Gnosis — Data Structure & Concurrency Plan
 
-**Date:** 2026-09-09 · **Status:** DRAFT (design plan, pre-implementation) ·
+**Date:** 2026-09-09 · **Status:** REALIZED (design plan; the design it pins is
+recorded as the ACTIVE `docs/decisions.md` decisions and implemented across
+§4.1–§4.6).
 **Type:** design/architecture analysis (not a behavior spec — the spec stays
 `docs/specs/gnosis.md`).
 
@@ -32,7 +34,7 @@ The resolution is to **split the state by how it is touched**:
 | **Mutation journal + query audit log** (appended only) | single-writer append | **writer-actor** (tokio task) or `Mutex<append>`; never a global lock on reads |
 | **Overlay layers** | pending writes scoped to an agent/workspace/transaction | overlay-first lookup over a revisioned base |
 
-The single source of truth (spec §4.2.7.2, §4.2.7.7 "Derived index not a second
+The single source of truth (spec §4.2.7.2 "Derived index not a second
 owner") is directly honored: **the graph owns** triples/vector fields/communities;
 all indexes are **rebuildable projections** of it. That maps naturally to
 "immutable snapshot, rebuilt on change."
@@ -251,5 +253,18 @@ the WriterActor), so the "check then act" cannot race across threads.
 - **ARC-SHARED-ENGINE** — engine is `Arc<Gnosis>` shared across tokio tasks; no
   global store lock.
 
-These are recorded in `docs/decisions.md` and inform the §4.1–§4.4 TestWriter
-red sets (which must exercise concurrency/optimistic-concurrency/overlay states).
+These are recorded in `docs/decisions.md` and informed the §4.1–§4.6 TestWriter
+red sets (which exercised concurrency/optimistic-concurrency/overlay states);
+the core engine is now implemented to them.
+
+**Realization note (per `docs/decisions.md`):** SHARDED-RWLOCK-STORE,
+IMMUTABLE-DERIVED-SNAPSHOT (`snapshot()`/`swap_snapshot()` on a
+`RwLock<Arc<DerivedIndexes>>`), and ARC-SHARED-ENGINE are applied as described
+here. WRITER-ACTOR-JOURNAL is applied in its **minimal** form — a synchronous
+`MutationJournal` (`RwLock<Vec<JournalEntry>>` + `AtomicU64 epoch`) appended in
+each mutation critical section — with the tokio writer-actor held off (the
+decision records this explicitly; the engine-side audit-log recording sink the
+actor would feed is deferred in `docs/pending.md`). The full writer-actor and the
+LAYERED-OVERLAY overlay layers are forward work: the overlay is decided but not
+yet realized in the store, so its overlaid-read states are not yet exercised by
+the current test set.

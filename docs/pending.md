@@ -34,6 +34,20 @@ must respect; (b) DEFERRED — lower-value gaps parked until a use case surfaces
 | **Full sub-task DAG (`subTaskDag`)** | Spec'd **opto-in / SHOULD-HAVE** (§4.5.4, same class as adaptive RAG F3, which is PARKED). Currently parsed + validated only; **decomposes nothing** — a single-node decomposition (the query itself) is the honest stand-in, no fake decomposition is fabricated (decision SUB-TASK-DAG-VALIDATED-ONLY). `SubTaskDagFailed` is a RESERVED variant (throwable once the real decomposition lands); no test requires it to throw. **PARKED (engine-internal deferred):** revisit with complex multi-hop queries; the DAG decomposition + a runner that fans sub-queries out (and merges their results) lands here. |
 | **Non-degradable compressor leg (`CompressionFailed`)** | The local compressor is **total** (Filter/Extract/Graph only transform; it degrades gracefully to uncompressed — spec-correct). `CompressionFailed` is a **RESERVED** variant for a future compressor leg that cannot degrade on failure. **PARKED:** only implement a throw-path when a real non-degradable compressor lands; do not fabricate a failure mode. |
 
+## DOC-REVIEW GAPS (surfaced by the 2026-09-09 core doc-review; not spec gaps)
+
+Real gaps found while reconciling the greens/specs to the crate. Each is a
+documented-but-untested behavior that **is** implementable/checkable from the
+current crate. Preferred recording over forcing a test in this pass because the
+session is docs-only (read-only on `src/`/`tests/`).
+
+| Item | Disposition / revisit condition |
+| --- | --- |
+| **Engine-assigned `documentId` (and `wikiId`) are not UUID v4** | Spec §4.1.1/§4.1.2 say `documentId`/`wikiId` are "stable, globally-unique … (UUID v4)". The crate assigns `doc-{N}` / `wiki-{N}` (a monotonic counter prefix), **not** an RFC-4122 UUID v4. This is a **REAL spec-impl tension** (a MUST-level contract claim not honored by the id scheme). **DISPOSITION:** deferred — either adopt UUID v4 for engine-assigned ids at the §5.1 engine-seam hardening pass, or formally reconcile the upstream contract to permit stable monotonic ids. Revisit when the F2 IPC seam lands (the id format is an on-the-wire contract). |
+| **`createdAt`/`updatedAt` ISO-8601 UTC format not pinned by any test** | Spec §4.1.1/§4.3.1 require ISO-8601 UTC timestamps. The crate's `iso_now()` does emit `YYYY-MM-DDThh:mm:ss.nnnnnnnnnZ` (ISO-8601 UTC), but no test asserts the format (only non-empty). **DISPOSITION: quick correctness pin** — a format assertion in the store + facts suites would close it; deferred because the session is docs-only. Revisit at the next test-authoring pass. |
+| **`author` metadata not round-trip-tested** | Spec §4.1.1 exposes `author` (string). The store sets `author` on `createDocument` and preserves it across `updateDocument`, but no test asserts it is stored/returned. **DISPOSITION: quick correctness pin** — an `author` round-trip + preserved-on-update assertion closes it; deferred because the session is docs-only. Revisit at the next test-authoring pass. |
+| **`MultiQueryExpansionFailed` (FS-19) fail-state is reachable but untested** | `expand_query_variants` genuinely returns `MultiQueryExpansionFailed` when a multi-query fan-out (`multiQuery:{enabled,n≥2}`) has **no distinct indexable term to add** (e.g. an empty/near-empty store: `term_popularity` yields nothing). Unlike the other engine-internal variants it is **drivable from a typed test** with no seam. **DISPOSITION: quick correctness pin** — seed a store with few/no indexable terms, run a multi-query `n≥2`, assert `MultiQueryExpansionFailed`; deferred because the session is docs-only. Revisit at the next test-authoring pass. |
+
 ## SPECULATIVE
 
 _(No Gnosis-specific speculative items yet — the parked layers are recorded in
