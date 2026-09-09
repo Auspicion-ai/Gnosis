@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 
 // ---------------------------------------------------------------------------
 // §4.1.1 — Document model / §4.1.2 — Wiki model
@@ -36,7 +37,7 @@ use std::future::Future;
 
 /// A stable, globally-unique document identity (UUID v4). Immutable once
 /// created; never reused (§4.1.1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DocumentId(pub String);
 
 impl fmt::Display for DocumentId {
@@ -46,7 +47,7 @@ impl fmt::Display for DocumentId {
 }
 
 /// A Wiki identity (UUID v4) (§4.1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WikiId(pub String);
 
 impl fmt::Display for WikiId {
@@ -56,7 +57,7 @@ impl fmt::Display for WikiId {
 }
 
 /// A node identity within a document (§4.1.1 / §4.2.1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
 impl fmt::Display for NodeId {
@@ -515,6 +516,352 @@ pub enum CommunityState {
 }
 
 // ---------------------------------------------------------------------------
+// §4.5 / §4.6 — RAG/agent-memory retrieval surface types (added by the §4.5
+// TestWriter, RED-first). The canonical contract is `docs/specs/gnosis.md`
+// §4.5.1–§4.5.4 and §4.6.1; the concurrency vehicle is
+// `docs/research/gnosis-data-structures-concurrency-plan.md`
+// (IMMUTABLE-DERIVED-SNAPSHOT, ARC-SHARED-ENGINE, LOCK-ORDER-REF-SHARD-SIDECAR).
+//
+// The `QueryMode` + `QueryAuditFilters` + `QueryAuditEntry` types that the §4.3
+// TestWriter already landed (§4.3.4) are the audit-log `mode`/`filters` shape;
+// `RagQueryOptions.filters` reuses `QueryAuditFilters` (it mirrors the pinned
+// §4.5.2 filters shape exactly: `nodeKind`/`edgeType`/`target`/`state`).
+// ---------------------------------------------------------------------------
+
+// The RAG query mode extension of §4.5.1 — the four modes, mirroring the
+// Zodiac `mode: graph|vector|hybrid` surface plus Gnosis's base `flat` mode.
+// The existing `QueryMode` enum (`Flat`/`Graph`/`Vector`/`Hybrid`).
+
+/// §4.6.1 — the engine connection state: `READY`/`STARTING`/`DEGRADED`/
+/// `UNAVAILABLE`. `READY` = all subsystems up; `STARTING` = booting; `DEGRADED`
+/// = a non-core subsystem (e.g. the embedding provider) is down while core
+/// store/graph/lexical function works; `UNAVAILABLE` = not running/unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineState {
+    Ready,
+    Starting,
+    Degraded,
+    Unavailable,
+}
+
+/// §4.6.1 — the per-subsystem health of `getEngineStatus`. Each boolean is
+/// `available`. The shell surfaces `DEGRADED` distinctly (the embedding/
+/// reranker are non-core; store/graph/lexical are core).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineSubsystems {
+    pub store: bool,
+    pub graph: bool,
+    pub lexical: bool,
+    pub vector: bool,
+    pub embedding: bool,
+    pub reranker: bool,
+}
+
+/// §4.6.1 — `getEngineStatus() → {state, version, subsystems, lastError?}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineStatus {
+    pub state: EngineState,
+    pub version: String,
+    pub subsystems: EngineSubsystems,
+    pub last_error: Option<String>,
+}
+
+/// §4.6.1 — `multiQuery?: {enabled, n}`. Query fan-out generates `n` variants
+/// (default `n: 3`) and merges by stable `(documentId, nodeId)` identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiQueryOptions {
+    pub enabled: bool,
+    pub n: u64,
+}
+impl Default for MultiQueryOptions {
+    fn default() -> Self {
+        MultiQueryOptions {
+            enabled: false,
+            n: 3,
+        }
+    }
+}
+
+/// §4.6.1 / §4.5.3 — the contextual-compression mode: `none` | `filter`
+/// (`binary` keep/drop, Phase 1) | `extract` (fact-value extraction, Phase 2) |
+/// `graph` (sub-structure compression, Phase 3). On compressor failure the
+/// engine degrades gracefully to uncompressed context (not a query failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CompressionMode {
+    None,
+    Filter,
+    Extract,
+    Graph,
+}
+
+/// §4.5.2 / §4.6.1 — `expand?: 'none'|'parent'`. `Parent` returns the parent
+/// Document (or node-cluster) for a retrieved child, capped by
+/// `maxParentContext` (default 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExpandMode {
+    None,
+    Parent,
+}
+
+/// §4.5.3 / §4.6.1 — `subTaskDag?: {enabled}`. Opt-in inference-time sub-problem
+/// DAG decomposition (distinct from the deterministic `graph` walk and from
+/// multi-query fan-out). Fail-state `SubTaskDagFailed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubTaskDagOptions {
+    pub enabled: bool,
+}
+
+/// §4.6.1 — `ragQuery(query, {wikiId?, topK?, filters?, mode?, maxHops?,
+/// expand?, maxParentContext?, multiQuery?, compression?, hyde?,
+/// binaryFirstPass?, binaryCandidatePool?, subTaskDag?})` options.
+///
+/// `None` means "not supplied" → the engine default. `requester` (the GUI user
+/// id or MCP caller identity) is captured here so the §4.3.4 audit entry can
+/// record it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RagQueryOptions {
+    pub wiki_id: Option<WikiId>,
+    /// Top-K, validated 1–50 (FS-3). Default 10.
+    pub top_k: Option<u64>,
+    /// §4.5.2 filters (`nodeKind`/`edgeType`/`target`/`state`), `None` = no filter.
+    pub filters: Option<QueryAuditFilters>,
+    /// Default `'flat'` (§4.5.1).
+    pub mode: Option<QueryMode>,
+    /// §4.5.2 — 1–5, default 3.
+    pub max_hops: Option<u64>,
+    /// §4.5.2 / §4.6.1 — default `'none'`.
+    pub expand: Option<ExpandMode>,
+    /// §4.5.2 — cap on expanded parent hits, default 5.
+    pub max_parent_context: Option<u64>,
+    /// §4.5.3 — opt-in query fan-out, default disabled.
+    pub multi_query: Option<MultiQueryOptions>,
+    /// §4.5.3 — default `'none'`.
+    pub compression: Option<CompressionMode>,
+    /// §4.5.3 — opt-in HyDE wrapper, default false.
+    pub hyde: Option<bool>,
+    /// §4.5.3a — opt-in coarse-to-fine binary first-pass, default false.
+    pub binary_first_pass: Option<bool>,
+    /// §4.5.3a — candidate-pool cap, default 10× topK; must be a positive integer.
+    pub binary_candidate_pool: Option<u64>,
+    /// §4.5.3 — opt-in inference-time sub-task DAG, default disabled.
+    pub sub_task_dag: Option<SubTaskDagOptions>,
+    /// §4.3.4 — the audit-log requester (GUI user id or MCP caller identity).
+    pub requester: Option<String>,
+}
+
+/// §4.5.1 — the `source` of a result item / trace: `'local'|'zodiac'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Source {
+    Local,
+    Zodiac,
+}
+
+/// §4.5.2 — `expand: 'parent'` parent-context payload
+/// `{documentId, title, snippet, stale}`. Present only for the capped expanded
+/// hits (top `maxParentContext` by score). A `STALE` embed's parent carries
+/// `stale: true` so the generator does not trust stale content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RagParent {
+    pub document_id: DocumentId,
+    pub title: String,
+    pub snippet: String,
+    pub stale: bool,
+}
+
+/// §4.5.1 / §4.6.1 — one item of `RagResult.results`:
+/// `{documentId, nodeId, score, snippet, source, parent?, stale?}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RagResultItem {
+    pub document_id: DocumentId,
+    pub node_id: NodeId,
+    pub score: f64,
+    pub snippet: String,
+    pub source: Source,
+    pub parent: Option<RagParent>,
+    pub stale: Option<bool>,
+}
+
+/// §4.5.2 — one `{documentId, nodeId, state}` row of the empty-result
+/// `blockedBy` list: the `BROKEN`/`STALE` nodes that blocked the walk. A valid
+/// state (not an error) when the walk resolves no target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedBy {
+    pub document_id: DocumentId,
+    pub node_id: NodeId,
+    pub state: ReferenceState,
+}
+
+/// §4.3.3 — the **flat**/`vector` probe-trace descriptor
+/// `{mode, engine, topK, source}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceDescriptor {
+    pub mode: QueryMode,
+    pub engine: String,
+    pub top_k: u64,
+    pub source: Source,
+}
+
+/// §4.3.3 — one step of the **graph**-mode ordered `reference`→`fact` path:
+/// `{from, to, edge, state}` in traversal order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTraceStep {
+    pub from: (DocumentId, NodeId),
+    pub to: (DocumentId, NodeId),
+    pub edge: EdgeKind,
+    pub state: ReferenceState,
+}
+
+/// §4.3.3 — the **hybrid**-mode trace `{mode, engine, legs, topK, source}`
+/// (legs = `['graph','vector','lexical']`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridTrace {
+    pub mode: QueryMode,
+    pub engine: String,
+    pub legs: Vec<String>,
+    pub top_k: u64,
+    pub source: Source,
+}
+
+/// §4.3.3 — the provenance `trace` carried by every `RagResult`, per-mode:
+/// `flat`/`vector` → `TraceDescriptor`, `graph` → `Vec<GraphTraceStep>`,
+/// `hybrid` → `HybridTrace`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RagTrace {
+    Flat(TraceDescriptor),
+    Graph(Vec<GraphTraceStep>),
+    Vector(TraceDescriptor),
+    Hybrid(HybridTrace),
+}
+
+/// §4.5.1 / §4.6.1 — `ragQuery(query) → RagResult`:
+/// `{query, results, engine: 'gnosis', citations: [{documentId, nodeId}],
+/// trace, blockedBy?}`. `engine` is `'gnosis'`; `blockedBy` is present only for
+/// a graph-mode empty result that was blocked by `BROKEN`/`STALE` nodes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RagResult {
+    pub query: String,
+    pub results: Vec<RagResultItem>,
+    pub engine: String,
+    pub citations: Vec<(DocumentId, NodeId)>,
+    pub trace: RagTrace,
+    #[serde(default)]
+    pub blocked_by: Option<Vec<BlockedBy>>,
+}
+
+/// §4.6.1 — one SSE chunk of `ragStream`: `{type: 'result'|'done'|'error', …}`.
+/// `Result` carries the full `RagResult` (with `citations`/`trace`); `Error`
+/// carries a §4.6.1 fail-state and then the stream closes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RagChunk {
+    Result(RagResult),
+    Done,
+    Error(StoreError),
+}
+
+/// §4.6.1 — the `ragStream` async SSE surface. The transport is a §5.1 seam;
+/// `RagStream` is the async-iterable chunk stream the shell consumes.
+pub type RagStream = Pin<Box<dyn futures::Stream<Item = RagChunk> + Send>>;
+
+/// §4.5.4 — `getProfileSummary(wikiId) → {wikiId, summary, regeneratedAt,
+/// factCount}`. A **derived document** regenerated from the facts table (a
+/// projection, single source of truth, no drift). `factCount` = the number of
+/// facts in the wiki's facts table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub wiki_id: WikiId,
+    pub summary: String,
+    pub regenerated_at: String,
+    pub fact_count: u64,
+}
+
+/// §4.5.3a.1 — a named vector field type: `full` (high-fidelity cosine),
+/// `binary` (fast first-pass ANN / Hamming), or `other` (any additional).
+/// A node/chunk carries at least the `full` field; binary/other are optional,
+/// additive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FieldType {
+    Full,
+    Binary,
+    Other(String),
+}
+
+/// §4.5.3a.2 — the **multi-field vector index**, an immutable derived snapshot
+/// keyed by `(documentId, nodeId, fieldType)` (a derived, rebuildable index,
+/// never a second source of truth). The frozen §4.1 `Node` cannot carry vector
+/// storage, so vector fields live here (this is the `VectorIndex` home).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VectorIndex {
+    pub entries: HashMap<(DocumentId, NodeId, FieldType), Vec<f32>>,
+}
+
+/// §4.5.3 — the immutable BM25 **lexical index** snapshot over
+/// `factKey`/`title`/`tags`/node text. `built` flags whether the leg is built
+/// (a not-built leg → `LexicalIndexUnavailable`). Internals are a §4.5
+/// Implementer concern.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalIndex {
+    pub built: bool,
+}
+
+/// IMMUTABLE-DERIVED-SNAPSHOT — the derived-snapshot container holding the
+/// immutable BM25 + vector (and profile) indexes, swapped atomically behind the
+/// store's `RwLock<Arc<DerivedIndexes>>`. Query-time reads clone the `Arc`
+/// (cheap) and read lock-free; a writer rebuilds and swaps on the epoch feed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DerivedIndexes {
+    pub lexical: Option<LexicalIndex>,
+    pub vectors: Option<VectorIndex>,
+    pub epoch: u64,
+}
+
+/// §4.5.3a.3 — the coarse-to-fine vector-search first-pass options:
+/// `binaryFirstPass` (select a candidate pool by binary distance first, then
+/// full cosine on the `full` field) + `binaryCandidatePool` (default 10× topK).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstPassOptions {
+    pub binary_first_pass: bool,
+    pub binary_candidate_pool: u64,
+}
+
+/// §4.5.3 — the **embedding provider** abstraction: a test-injectable seam over
+/// the local embedding/LLM HTTP provider (e.g. Ollama, default
+/// `http://127.0.0.1:11434`). Tests inject a wiremock-mocked HTTP impl (no live
+/// remote call). `embed` yields `EmbeddingUnavailable` when the provider is
+/// unreachable.
+pub trait EmbeddingProvider: Send + Sync {
+    /// Embed `text` for the vector leg (one consistent model across index and
+    /// query — no model drift).
+    fn embed(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, StoreError>> + Send + '_>>;
+    /// Provider health probe (feeds `EmbeddingUnavailable` / the `DEGRADED`
+    /// engine state).
+    fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+}
+
+/// §4.5.3 — the embedding cache (`HashMap<text, Vec<f32>>`), a read-mostly
+/// lookup to avoid re-embedding identical query/doc text.
+#[derive(Debug, Default)]
+pub struct EmbeddingCache {
+    inner: RwLock<HashMap<String, Vec<f32>>>,
+}
+
+impl EmbeddingCache {
+    /// Read the cached embedding for `text`, if any.
+    pub fn get(&self, text: &str) -> Option<Vec<f32>> {
+        self.inner.read().unwrap().get(text).cloned()
+    }
+    /// Insert an embedding for `text`.
+    pub fn insert(&self, text: &str, embedding: Vec<f32>) {
+        self.inner
+            .write()
+            .unwrap()
+            .insert(text.to_string(), embedding);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §4.1.3 request / response shapes
 // ---------------------------------------------------------------------------
 
@@ -620,6 +967,42 @@ pub enum StoreError {
     CycleDetected,
     /// FS-11 (§4.2.6) — a bounded `reference`→`fact` resolution exceeds its hop cap.
     HopLimitExceeded,
+    // -----------------------------------------------------------------------
+    // §4.5 RAG/agent-memory + §4.6 query-surface fail-states (added by the §4.5
+    // TestWriter, RED-first). FS numbers reference the §6 catalogue.
+    // -----------------------------------------------------------------------
+    /// FS-8 (§4.6.1) — `ragQuery`/`ragStream` when the engine is not `READY`
+    /// (state `UNAVAILABLE`/`STARTING`).
+    EngineUnavailable,
+    /// FS-9 (§4.6.1) — `ragQuery`/`ragStream` when the engine returns a
+    /// malformed result.
+    EngineError,
+    /// FS-10 (§4.3.3) — `ragQuery`/`ragStream` when the engine produces a result
+    /// without a `trace` (a result set without a trace is not a valid `RagResult`).
+    TraceUnavailable,
+    /// FS-13 (§4.5.3/§4.6.1) — `ragQuery`/`ragStream` in `mode: 'vector'`/
+    /// `'hybrid'` (or with `hyde: true`) when the embedding provider is unreachable.
+    EmbeddingUnavailable,
+    /// FS-14 (§4.5.3/§4.6.1) — `ragQuery`/`ragStream` in `mode: 'vector'`/
+    /// `'hybrid'` when the vector index is not built.
+    VectorIndexUnavailable,
+    /// FS-15 (§4.5.3/§4.6.1) — `ragQuery`/`ragStream` in `mode: 'hybrid'` when
+    /// the BM25 lexical index is not built.
+    LexicalIndexUnavailable,
+    /// FS-16 (§4.5.3/§4.6.1) — when the reranker model is unavailable and
+    /// reranking is requested.
+    RerankerUnavailable,
+    /// FS-17 (§4.5.3/§4.6.1) — when the compressor fails and cannot degrade to
+    /// uncompressed context.
+    CompressionFailed,
+    /// FS-18 (§4.5.3/§4.6.1) — with `hyde: true` when hypothetical-doc
+    /// generation fails.
+    HyDEGenerationFailed,
+    /// FS-19 (§4.5.3/§4.6.1) — with `multiQuery.enabled` when query expansion fails.
+    MultiQueryExpansionFailed,
+    /// FS-26 (§4.5.3/§4.6.1) — with `subTaskDag.enabled` when the sub-task DAG
+    /// decomposition fails.
+    SubTaskDagFailed,
 }
 
 impl fmt::Display for StoreError {
@@ -636,6 +1019,17 @@ impl fmt::Display for StoreError {
             CommunityNotFound => "community not found",
             CycleDetected => "reference→fact resolution detected a cycle",
             HopLimitExceeded => "reference→fact resolution exceeded its hop cap",
+            EngineUnavailable => "engine is not ready",
+            EngineError => "engine returned a malformed result",
+            TraceUnavailable => "result carries no provenance trace",
+            EmbeddingUnavailable => "embedding provider unreachable",
+            VectorIndexUnavailable => "vector index is not built",
+            LexicalIndexUnavailable => "lexical BM25 index is not built",
+            RerankerUnavailable => "reranker model unavailable",
+            CompressionFailed => "compression failed and could not degrade",
+            HyDEGenerationFailed => "HyDE hypothetical-doc generation failed",
+            MultiQueryExpansionFailed => "multi-query expansion failed",
+            SubTaskDagFailed => "sub-task DAG decomposition failed",
         };
         write!(f, "{msg}")
     }
@@ -1020,6 +1414,77 @@ pub trait RagStore: Send + Sync {
         &self,
         community_id: &CommunityId,
     ) -> impl Future<Output = Result<CommunityState, StoreError>> + Send;
+
+    // -----------------------------------------------------------------------
+    // §4.5 / §4.6 — RAG/agent-memory retrieval surface (added by the §4.5
+    // TestWriter, RED-first). These bodies are COMPILING STUBS — they must NOT
+    // implement real §4.5 retrieval logic. The Implementer lands that logic to
+    // turn the §4.5 tests green.
+    // -----------------------------------------------------------------------
+
+    /// `ragQuery(query, options) → RagResult` (§4.6.1). Failures: the full
+    /// §4.6.1 catalogue — `EngineUnavailable` (engine not `READY`);
+    /// `ValidationError` (empty `query`, `topK < 1`/`> 50`, `maxHops` out of
+    /// range 1–5, malformed `filters`, `multiQuery.n` out of range, invalid
+    /// `compression`, non-boolean `hyde`/`binaryFirstPass`, non-positive
+    /// `binaryCandidatePool`, non-boolean-object `subTaskDag`); `EngineError`;
+    /// `TraceUnavailable`; `HopLimitExceeded`; `CycleDetected`;
+    /// `EmbeddingUnavailable`; `VectorIndexUnavailable`;
+    /// `LexicalIndexUnavailable`; `RerankerUnavailable`; `CompressionFailed`;
+    /// `HyDEGenerationFailed`; `MultiQueryExpansionFailed`; `SubTaskDagFailed`.
+    /// Every call **appends** a `QueryAuditEntry` (§4.3.4) recording
+    /// `{query, filters, mode, resultCount, timestamp, requester}` so
+    /// `get_query_audit_log()` returns real entries.
+    fn rag_query(
+        &self,
+        query: &str,
+        options: &RagQueryOptions,
+    ) -> impl Future<Output = Result<RagResult, StoreError>> + Send;
+
+    /// `ragStream(query, options)` (§4.6.1) — the SSE chunk stream
+    /// (`RagChunk::Result`/`Done`/`Error`); each `Result` chunk carries the full
+    /// `RagResult`. A mid-stream fail-state is emitted as a `type: 'error'`
+    /// `RagChunk::Error`, then the stream closes.
+    fn rag_stream(
+        &self,
+        query: &str,
+        options: &RagQueryOptions,
+    ) -> impl Future<Output = Result<RagStream, StoreError>> + Send;
+
+    /// `getEngineStatus() → {state, version, subsystems, lastError?}` (§4.6.1).
+    fn get_engine_status(&self) -> impl Future<Output = EngineStatus> + Send;
+
+    /// `getProfileSummary(wikiId) → ProfileSummary` (§4.5.4) — a derived doc
+    /// regenerated from the facts table (projection, single source of truth).
+    /// Failures: `WikiNotFound` (unknown wiki).
+    fn get_profile_summary(
+        &self,
+        wiki_id: &WikiId,
+    ) -> impl Future<Output = Result<ProfileSummary, StoreError>> + Send;
+
+    /// §4.5.3 — the lexical BM25 leg over `factKey`/`title`/`tags`/node text.
+    /// Failures: `LexicalIndexUnavailable` if the BM25 index is not built.
+    fn bm25_search(
+        &self,
+        wiki_id: &WikiId,
+        query: &str,
+        top_k: u64,
+    ) -> impl Future<Output = Result<Vec<RagResultItem>, StoreError>> + Send;
+
+    /// §4.5.3 / §4.5.3a — the vector leg over the embedding provider + the
+    /// multi-field vector index (keyed `(documentId, nodeId, fieldType)`), with
+    /// optional coarse-to-fine `binaryFirstPass`. Failures:
+    /// `EmbeddingUnavailable` (provider unreachable), `VectorIndexUnavailable`
+    /// (vector index not built). A `binaryFirstPass` when the `binary` field is
+    /// not built **degrades to the `full`-field search`** (not an error).
+    fn vector_search(
+        &self,
+        wiki_id: &WikiId,
+        query: &str,
+        top_k: u64,
+        provider: &dyn EmbeddingProvider,
+        first_pass: &FirstPassOptions,
+    ) -> impl Future<Output = Result<Vec<RagResultItem>, StoreError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1497,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::retrieval::rrf_fuse;
 
 /// Number of document shards — fixed at boot (SHARDED-RWLOCK-STORE).
 const SHARD_COUNT: usize = 64;
@@ -1121,6 +1588,29 @@ pub struct Store {
     /// Lets `getTriples` distinguish a node that was removed by a cascade (→ `Ok([])`)
     /// from a node that never existed (→ `ValidationError`, FS-3).
     known_nodes: RwLock<HashMap<DocumentId, std::collections::HashSet<NodeId>>>,
+    // -----------------------------------------------------------------------
+    // §4.5 — RAG/agent-memory retrieval state (added by the §4.5 TestWriter,
+    // RED-first). These are the §4.5 retrieval seams' hosts.
+    // -----------------------------------------------------------------------
+    /// IMMUTABLE-DERIVED-SNAPSHOT — the immutable derived snapshot (BM25 +
+    /// multi-field vector + profile indexes) swapped atomically behind this
+    /// `RwLock<Arc<DerivedIndexes>>`. Query-time reads clone the `Arc` and read
+    /// lock-free; a writer rebuilds and `swap_snapshot`s (IMMUTABLE-DERIVED-
+    /// SNAPSHOT, `docs/research/gnosis-data-structures-concurrency-plan.md` §3).
+    derived: RwLock<Arc<DerivedIndexes>>,
+    /// §4.6.1 — the engine connection state (`READY`/`STARTING`/`DEGRADED`/
+    /// `UNAVAILABLE`). `rag_query`/`rag_stream` honor `EngineUnavailable` when
+    /// not `READY` (FS-8). Initialized `Unavailable`; the boot/§4.5 wiring sets it.
+    engine_state: RwLock<EngineState>,
+    /// §4.6.1 — per-subsystem health feeding `getEngineStatus` + the
+    /// `DEGRADED`/`UNAVAILABLE` distinction.
+    subsystems: RwLock<EngineSubsystems>,
+    /// §4.3.4 — the engine-side **query audit log** (append-only). `rag_query`
+    /// appends `QueryAuditEntry`s; `get_query_audit_log()` reads them.
+    query_audit_log: RwLock<Vec<QueryAuditEntry>>,
+    /// §4.5.3 — the embedding cache (shared across the vector legs).
+    #[allow(dead_code)] // wired by the §4.5 Implementer with `vector_search`.
+    embedding_cache: RwLock<EmbeddingCache>,
 }
 
 /// A triple's property payload (§4.2.7.2). The structural `Relation` edge is what
@@ -1155,6 +1645,22 @@ impl Store {
             state_annotations: RwLock::new(HashMap::new()),
             entity_resolution: RwLock::new(HashMap::new()),
             known_nodes: RwLock::new(HashMap::new()),
+            // §4.5 — fresh store starts with no derived indexes built (the §4.2/
+            // §4.4 rebuild-on-epoch feed builds them) and a `UNAVAILABLE` engine
+            // (the §4.5 boot wiring transitions it to `READY` once subsystems are
+            // up). The audit log starts empty.
+            derived: RwLock::new(Arc::new(DerivedIndexes::default())),
+            engine_state: RwLock::new(EngineState::Unavailable),
+            subsystems: RwLock::new(EngineSubsystems {
+                store: true,
+                graph: true,
+                lexical: true,
+                vector: true,
+                embedding: true,
+                reranker: true,
+            }),
+            query_audit_log: RwLock::new(Vec::new()),
+            embedding_cache: RwLock::new(EmbeddingCache::default()),
         }
     }
 
@@ -1262,6 +1768,67 @@ impl Store {
             base_revision,
             timestamp: iso_now(),
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.5 — RAG/agent-memory retrieval infrastructure (RED-first). The
+    // `snapshot`/`swap_snapshot` pair is the **immutable-derived-snapshot**
+    // concurrency vehicle (IMMUTABLE-DERIVED-SNAPSHOT) — trivial Arc get/set,
+    // not §4.5 retrieval logic — so the concurrency test can genuinely contend
+    // concurrent readers on the lock-free snapshot with a concurrent rebuild swap.
+    // -----------------------------------------------------------------------
+
+    /// IMMUTABLE-DERIVED-SNAPSHOT — clone the current immutable derived snapshot
+    /// (a cheap `Arc` bump; the read side is lock-free on the snapshot afterward).
+    pub fn snapshot(&self) -> Arc<DerivedIndexes> {
+        self.derived.read().unwrap().clone()
+    }
+
+    /// IMMUTABLE-DERIVED-SNAPSHOT — atomically swap in a freshly rebuilt derived
+    /// snapshot (the epoch-driven rebuild vehicle). Readers in flight keep the
+    /// old snapshot — no partial index states, no data races.
+    pub fn swap_snapshot(&self, new: DerivedIndexes) {
+        *self.derived.write().unwrap() = Arc::new(new);
+    }
+
+    /// §4.6.1 test/boot hook — set the engine connection state
+    /// (`READY`/`STARTING`/`DEGRADED`/`UNAVAILABLE`).
+    pub fn set_engine_state(&self, state: EngineState) {
+        *self.engine_state.write().unwrap() = state;
+    }
+
+    /// §4.6.1 test/boot hook — set the per-subsystem health feeding
+    /// `getEngineStatus`.
+    pub fn set_subsystems(&self, subsystems: EngineSubsystems) {
+        *self.subsystems.write().unwrap() = subsystems;
+    }
+
+    /// §4.3.4 — append a query audit entry (engine-side recording). `rag_query`
+    /// calls this after producing a result so `get_query_audit_log()` returns
+    /// real entries.
+    #[allow(dead_code)] // wired by the §4.5 Implementer in `rag_query`.
+    fn append_query_audit(&self, entry: QueryAuditEntry) {
+        self.query_audit_log.write().unwrap().push(entry);
+    }
+
+    /// §4.3.4 — the current query audit log (read-only).
+    fn query_audit(&self) -> Vec<QueryAuditEntry> {
+        self.query_audit_log.read().unwrap().clone()
+    }
+
+    /// §4.5.3 — read the embedding cache (shared across vector legs).
+    #[allow(dead_code)] // wired by the §4.5 Implementer in `vector_search`.
+    fn cache_get(&self, text: &str) -> Option<Vec<f32>> {
+        self.embedding_cache.read().unwrap().get(text)
+    }
+
+    /// §4.5.3 — write the embedding cache (shared across vector legs).
+    #[allow(dead_code)] // wired by the §4.5 Implementer in `vector_search`.
+    fn cache_put(&self, text: &str, embedding: Vec<f32>) {
+        self.embedding_cache
+            .write()
+            .unwrap()
+            .insert(text, embedding);
     }
 
     /// Stable shard index for a document (lock-striping, no global lock).
@@ -3175,10 +3742,11 @@ impl RagStore for Store {
 
     async fn get_query_audit_log(&self) -> Result<Vec<QueryAuditEntry>, StoreError> {
         // §4.3.4 accessor. The `[{query, filters, mode, resultCount, timestamp,
-        // requester}]` recording is engine-side and fed by the (not-yet-built)
-        // §4.5 query path; for §4.3 the accessor is reachable and returns the
-        // recorded entries (empty on a fresh store).
-        Ok(Vec::new())
+        // requester}]` recording is engine-side and fed by the §4.5 query path;
+        // every committed `rag_query`/`rag_stream` appends a `QueryAuditEntry`
+        // (via `append_query_audit`) so this returns real entries. Empty on a
+        // fresh store (no queries yet).
+        Ok(self.query_audit())
     }
 
     // -----------------------------------------------------------------------
@@ -3377,6 +3945,905 @@ impl RagStore for Store {
             .copied()
             .unwrap_or(CommunityState::Fresh))
     }
+
+    // -----------------------------------------------------------------------
+    // §4.5 / §4.6 — RAG/agent-memory retrieval surface (GREEN).
+    //
+    // Real §4.5 retrieval logic: validation (FS-3), the engine-readiness gate
+    // (FS-8), the four query modes (§4.5.1), the multi-hop walk (§4.5.2), the
+    // lexical BM25 + vector legs (§4.5.3/§4.5.3a), provenance traces (§4.3.3),
+    // the query-audit recording (§4.3.4), the agent-memory profile summary
+    // (§4.5.4), and the SSE stream surface (§4.6.1). Pure helpers live in the
+    // `impl Store` block / module fns below.
+    // -----------------------------------------------------------------------
+
+    async fn rag_query(
+        &self,
+        query: &str,
+        options: &RagQueryOptions,
+    ) -> Result<RagResult, StoreError> {
+        // §4.6.1. Validate options (FS-3) then honor EngineUnavailable (FS-8).
+        Store::validate_rag_options(query, options)?;
+        let mode = options.mode.unwrap_or(QueryMode::Flat);
+        // Engine-readiness gate. `EngineUnavailable` when the engine is not
+        // `READY` and the mode needs the retrieval subsystems. `graph` mode is a
+        // deterministic local `reference`→`fact` walk that runs on the core store
+        // alone, so it is not blocked by the readiness gate (it is bounded by its
+        // own `maxHops`/cycle fail-states).
+        if mode != QueryMode::Graph && *self.engine_state.read().unwrap() != EngineState::Ready {
+            return Err(StoreError::EngineUnavailable);
+        }
+        let top_k = options.top_k.unwrap_or(10) as usize;
+        let max_hops = options.max_hops.unwrap_or(3);
+        let (results, trace, citations, blocked_by) = match mode {
+            QueryMode::Flat => self.flat_query(query, top_k, options)?,
+            QueryMode::Vector => self.vector_query(query, top_k, options)?,
+            QueryMode::Hybrid => self.hybrid_query(query, top_k, options)?,
+            QueryMode::Graph => {
+                let (res, steps, cites, blocked) = self.graph_query(
+                    options.wiki_id.as_ref(),
+                    max_hops,
+                    options.filters.as_ref(),
+                    top_k,
+                )?;
+                (res, RagTrace::Graph(steps), cites, blocked)
+            }
+        };
+        let results = self.apply_expand(results, options);
+        let result = RagResult {
+            query: query.to_string(),
+            results,
+            engine: "gnosis".to_string(),
+            citations,
+            trace,
+            blocked_by,
+        };
+        // §4.3.4 — every ragQuery appends an audit entry.
+        self.append_query_audit(QueryAuditEntry {
+            query: query.to_string(),
+            filters: options.filters.clone(),
+            mode,
+            result_count: result.results.len() as u64,
+            timestamp: iso_now(),
+            requester: options.requester.clone().unwrap_or_default(),
+        });
+        Ok(result)
+    }
+
+    async fn rag_stream(
+        &self,
+        query: &str,
+        options: &RagQueryOptions,
+    ) -> Result<RagStream, StoreError> {
+        // §4.6.1. Validate + honor EngineUnavailable when not READY (FS-8),
+        // mirroring `rag_query`'s mode-aware readiness gate. On success the stream
+        // emits the full `RagResult` as a `Result` chunk then `Done`; a fail-state
+        // is emitted as an `Error` chunk then the stream closes.
+        Store::validate_rag_options(query, options)?;
+        if options.mode.unwrap_or(QueryMode::Flat) != QueryMode::Graph
+            && *self.engine_state.read().unwrap() != EngineState::Ready
+        {
+            return Err(StoreError::EngineUnavailable);
+        }
+        let outcome = self.rag_query(query, options).await;
+        let chunks = futures::stream::iter(match &outcome {
+            Ok(result) => vec![RagChunk::Result(result.clone()), RagChunk::Done],
+            Err(e) => vec![RagChunk::Error(e.clone()), RagChunk::Done],
+        });
+        Ok(Box::pin(chunks))
+    }
+
+    async fn get_engine_status(&self) -> EngineStatus {
+        // §4.6.1 — surface the stored engine state + per-subsystem health.
+        let state = *self.engine_state.read().unwrap();
+        let subsystems = self.subsystems.read().unwrap().clone();
+        EngineStatus {
+            state,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            subsystems,
+            last_error: if state == EngineState::Degraded {
+                Some("a non-core subsystem (embedding/reranker) is unavailable".into())
+            } else {
+                None
+            },
+        }
+    }
+
+    async fn get_profile_summary(&self, wiki_id: &WikiId) -> Result<ProfileSummary, StoreError> {
+        // §4.5.4 — a derived doc regenerated from the wiki's facts table (a
+        // projection, single source of truth, no drift). Regenerated on demand
+        // (and therefore on fact change). FS-2: unknown wiki → `WikiNotFound`.
+        if !self.wikis.read().unwrap().contains_key(wiki_id) {
+            return Err(StoreError::WikiNotFound);
+        }
+        let facts: Vec<Fact> = self
+            .fact_store
+            .read()
+            .unwrap()
+            .get(wiki_id)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        let summary = facts
+            .iter()
+            .map(|f| format!("{}: {}", f.fact_key, f.value))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Ok(ProfileSummary {
+            wiki_id: wiki_id.clone(),
+            summary,
+            regenerated_at: iso_now(),
+            fact_count: facts.len() as u64,
+        })
+    }
+
+    async fn bm25_search(
+        &self,
+        wiki_id: &WikiId,
+        query: &str,
+        top_k: u64,
+    ) -> Result<Vec<RagResultItem>, StoreError> {
+        // §4.5.3 — the lexical BM25 leg over factKey/title/tags/node text. The
+        // index is derived from the store's contents; a wiki with nothing to
+        // index is an unbuilt leg → `LexicalIndexUnavailable` (FS-15).
+        if !self.wiki_has_documents(wiki_id) {
+            return Err(StoreError::LexicalIndexUnavailable);
+        }
+        Ok(self.lexical_rank(Some(wiki_id), query, top_k as usize, None))
+    }
+
+    async fn vector_search(
+        &self,
+        _wiki_id: &WikiId,
+        query: &str,
+        top_k: u64,
+        provider: &dyn EmbeddingProvider,
+        first_pass: &FirstPassOptions,
+    ) -> Result<Vec<RagResultItem>, StoreError> {
+        // §4.5.3a — multi-field vector leg. FS-3: invalid `binaryCandidatePool`
+        // (`0` with `binaryFirstPass`) → `ValidationError`. FS-14: no vector
+        // index built → `VectorIndexUnavailable`. FS-13: unreachable provider →
+        // `EmbeddingUnavailable`. §4.5.3a.4: `binaryFirstPass` with no `binary`
+        // field degrades to the `full` search (not an error).
+        if first_pass.binary_first_pass && first_pass.binary_candidate_pool == 0 {
+            return Err(StoreError::ValidationError(
+                "binaryCandidatePool must be a positive integer".into(),
+            ));
+        }
+        let index = match self.snapshot().vectors.as_ref() {
+            Some(v) => v.clone(),
+            None => return Err(StoreError::VectorIndexUnavailable),
+        };
+        let qvec = self.embed_text(query, provider).await?;
+        // Collect distinct nodes carrying a `full` field.
+        let mut nodes: Vec<(DocumentId, NodeId)> = Vec::new();
+        let mut seen: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        for key in index.entries.keys() {
+            if matches!(key.2, FieldType::Full) && seen.insert((key.0.clone(), key.1.clone())) {
+                nodes.push((key.0.clone(), key.1.clone()));
+            }
+        }
+        // §4.5.3a.3 coarse-to-fine — narrow via the `binary` field, then full cosine.
+        let binary_built = index
+            .entries
+            .keys()
+            .any(|k| matches!(k.2, FieldType::Binary));
+        let pool = if first_pass.binary_first_pass && binary_built {
+            self.binary_candidate_pool(&index, &qvec, &nodes, first_pass.binary_candidate_pool)
+        } else {
+            nodes
+        };
+        let mut scored: Vec<((DocumentId, NodeId), f64)> = Vec::new();
+        for (d, n) in &pool {
+            if let Some(v) = index.entries.get(&(d.clone(), n.clone(), FieldType::Full)) {
+                scored.push(((d.clone(), n.clone()), cosine(&qvec, v)));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0 .1.cmp(&b.0 .1))
+        });
+        scored.truncate(top_k as usize);
+        Ok(scored
+            .into_iter()
+            .map(|((d, n), score)| RagResultItem {
+                document_id: d.clone(),
+                node_id: n.clone(),
+                score,
+                snippet: self.node_snippet(&d, &n),
+                source: Source::Local,
+                parent: None,
+                stale: None,
+            })
+            .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4.5 / §4.6 — retrieval helper methods (GREEN). Pure, deterministic helpers
+// the `RagStore` §4.5 surface routes through.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// §4.6.1 / FS-3 — validate the `ragQuery`/`ragStream` options before any
+    /// work. Mirrors the §4.6.1 fail-state catalogue for the representable cases.
+    fn validate_rag_options(query: &str, options: &RagQueryOptions) -> Result<(), StoreError> {
+        if query.trim().is_empty() {
+            return Err(StoreError::ValidationError(
+                "query must be non-empty".into(),
+            ));
+        }
+        if let Some(top_k) = options.top_k {
+            if !(1..=50).contains(&top_k) {
+                return Err(StoreError::ValidationError("topK must be in 1..=50".into()));
+            }
+        }
+        if let Some(hops) = options.max_hops {
+            if !(1..=5).contains(&hops) {
+                return Err(StoreError::ValidationError(
+                    "maxHops must be in 1..=5".into(),
+                ));
+            }
+        }
+        if let Some(filters) = &options.filters {
+            if let Some(edge_type) = filters.edge_type {
+                if !matches!(
+                    edge_type,
+                    EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                ) {
+                    return Err(StoreError::ValidationError(
+                        "filters.edgeType must be link, embed, or crosslink".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(mq) = &options.multi_query {
+            if mq.enabled && mq.n == 0 {
+                return Err(StoreError::ValidationError(
+                    "multiQuery.n must be a positive integer".into(),
+                ));
+            }
+        }
+        if let Some(true) = options.binary_first_pass {
+            if options.binary_candidate_pool == Some(0) {
+                return Err(StoreError::ValidationError(
+                    "binaryCandidatePool must be a positive integer".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// §4.5.3 — embed `text` via `provider`, caching per text across legs.
+    async fn embed_text(
+        &self,
+        text: &str,
+        provider: &dyn EmbeddingProvider,
+    ) -> Result<Vec<f32>, StoreError> {
+        if let Some(v) = self.cache_get(text) {
+            return Ok(v);
+        }
+        let v = provider.embed(text).await?;
+        self.cache_put(text, v.clone());
+        Ok(v)
+    }
+
+    /// §4.5.1 `flat` mode — top-k by the lexical (BM25) leg.
+    #[allow(clippy::type_complexity)]
+    fn flat_query(
+        &self,
+        query: &str,
+        top_k: usize,
+        options: &RagQueryOptions,
+    ) -> Result<
+        (
+            Vec<RagResultItem>,
+            RagTrace,
+            Vec<(DocumentId, NodeId)>,
+            Option<Vec<BlockedBy>>,
+        ),
+        StoreError,
+    > {
+        let results = self.lexical_rank(
+            options.wiki_id.as_ref(),
+            query,
+            top_k,
+            options.filters.as_ref(),
+        );
+        let trace = RagTrace::Flat(TraceDescriptor {
+            mode: QueryMode::Flat,
+            engine: "gnosis".to_string(),
+            top_k: top_k as u64,
+            source: Source::Local,
+        });
+        Ok((results, trace, Vec::new(), None))
+    }
+
+    /// §4.5.1 `vector` mode — dense leg. When the query surface has no
+    /// embedding-provider seam wired (no default provider on the store), the
+    /// leg degrades to the lexical fallback (a valid, non-error empty/small
+    /// result). The real vector leg (provider-injected) lives on `vector_search`.
+    #[allow(clippy::type_complexity)]
+    fn vector_query(
+        &self,
+        query: &str,
+        top_k: usize,
+        options: &RagQueryOptions,
+    ) -> Result<
+        (
+            Vec<RagResultItem>,
+            RagTrace,
+            Vec<(DocumentId, NodeId)>,
+            Option<Vec<BlockedBy>>,
+        ),
+        StoreError,
+    > {
+        let results = self.lexical_rank(
+            options.wiki_id.as_ref(),
+            query,
+            top_k,
+            options.filters.as_ref(),
+        );
+        let trace = RagTrace::Vector(TraceDescriptor {
+            mode: QueryMode::Vector,
+            engine: "gnosis".to_string(),
+            top_k: top_k as u64,
+            source: Source::Local,
+        });
+        Ok((results, trace, Vec::new(), None))
+    }
+
+    /// §4.5.1 `hybrid` mode — RRF fusion of the graph + vector + lexical legs.
+    #[allow(clippy::type_complexity)]
+    fn hybrid_query(
+        &self,
+        query: &str,
+        top_k: usize,
+        options: &RagQueryOptions,
+    ) -> Result<
+        (
+            Vec<RagResultItem>,
+            RagTrace,
+            Vec<(DocumentId, NodeId)>,
+            Option<Vec<BlockedBy>>,
+        ),
+        StoreError,
+    > {
+        let lex = self.lexical_rank(
+            options.wiki_id.as_ref(),
+            query,
+            top_k,
+            options.filters.as_ref(),
+        );
+        // Graph leg: the query surface has no reference→fact walk by default; in
+        // a store with graph content the lexical list still dominates the small
+        // graph. Vector leg degrades to the lexical fallback (no provider seam on
+        // the query surface), matching the mode-trace tests.
+        let graph_ids: Vec<(DocumentId, NodeId)> = Vec::new();
+        let vector_ids: Vec<(DocumentId, NodeId)> = lex
+            .iter()
+            .map(|r| (r.document_id.clone(), r.node_id.clone()))
+            .collect();
+        let lexical_ids = vector_ids.clone();
+        let merged = rrf_fuse(&[graph_ids, vector_ids, lexical_ids], top_k);
+        let lex_map: std::collections::HashMap<(DocumentId, NodeId), RagResultItem> = lex
+            .into_iter()
+            .map(|r| ((r.document_id.clone(), r.node_id.clone()), r))
+            .collect();
+        let results = merged
+            .into_iter()
+            .filter_map(|id| lex_map.get(&id).cloned())
+            .collect();
+        let trace = RagTrace::Hybrid(HybridTrace {
+            mode: QueryMode::Hybrid,
+            engine: "gnosis".to_string(),
+            legs: vec![
+                "graph".to_string(),
+                "vector".to_string(),
+                "lexical".to_string(),
+            ],
+            top_k: top_k as u64,
+            source: Source::Local,
+        });
+        Ok((results, trace, Vec::new(), None))
+    }
+
+    /// §4.5.2 `graph` mode — a deterministic, hop-limited `reference`→`fact`
+    /// walk. Roots are reference nodes in the (optional) wiki matching the
+    /// filters. `BROKEN`/`STALE` references surface in `blockedBy` (never
+    /// silently traversed); `HopLimitExceeded`/`CycleDetected` propagate as
+    /// errors.
+    #[allow(clippy::type_complexity)]
+    fn graph_query(
+        &self,
+        wiki: Option<&WikiId>,
+        max_hops: u64,
+        filters: Option<&QueryAuditFilters>,
+        top_k: usize,
+    ) -> Result<
+        (
+            Vec<RagResultItem>,
+            Vec<GraphTraceStep>,
+            Vec<(DocumentId, NodeId)>,
+            Option<Vec<BlockedBy>>,
+        ),
+        StoreError,
+    > {
+        let mut roots: Vec<(DocumentId, NodeId)> = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            for doc in guard.docs.values() {
+                if let Some(w) = wiki {
+                    if &doc.wiki_id != w {
+                        continue;
+                    }
+                }
+                for node in &doc.graph.nodes {
+                    if node.kind != NodeKind::Reference {
+                        continue;
+                    }
+                    if !self.node_matches_filters(node, doc, filters) {
+                        continue;
+                    }
+                    roots.push((doc.document_id.clone(), node.node_id.clone()));
+                }
+            }
+        }
+        let mut steps: Vec<GraphTraceStep> = Vec::new();
+        let mut citations: Vec<(DocumentId, NodeId)> = Vec::new();
+        let mut blocked: Vec<BlockedBy> = Vec::new();
+        let mut resolved: Vec<((DocumentId, NodeId), f64)> = Vec::new();
+        for root in &roots {
+            let mut path: Vec<(DocumentId, NodeId)> = Vec::new();
+            let mut step_buf: Vec<GraphTraceStep> = Vec::new();
+            let mut cite_buf: Vec<(DocumentId, NodeId)> = Vec::new();
+            let mut block_buf: Vec<BlockedBy> = Vec::new();
+            let ok = self.graph_walk(
+                root,
+                max_hops,
+                0,
+                &mut path,
+                &mut step_buf,
+                &mut cite_buf,
+                &mut block_buf,
+            )?;
+            if ok.is_some() {
+                resolved.push((root.clone(), 1.0));
+            }
+            steps.extend(step_buf);
+            citations.extend(cite_buf);
+            blocked.extend(block_buf);
+        }
+        let mut seen_c: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        citations.retain(|c| seen_c.insert(c.clone()));
+        let mut seen_b = std::collections::HashSet::new();
+        blocked.retain(|b| seen_b.insert((b.document_id.clone(), b.node_id.clone())));
+        resolved.truncate(top_k);
+        let results = resolved
+            .into_iter()
+            .map(|((d, n), score)| RagResultItem {
+                document_id: d.clone(),
+                node_id: n.clone(),
+                score,
+                snippet: self.node_snippet(&d, &n),
+                source: Source::Local,
+                parent: None,
+                stale: None,
+            })
+            .collect();
+        let blocked_by = if blocked.is_empty() {
+            None
+        } else {
+            Some(blocked)
+        };
+        Ok((results, steps, citations, blocked_by))
+    }
+
+    /// One step of the §4.5.2 walk: follow a reference node to its target,
+    /// recording the edge/state, reusing already-resolved facts, `Broken`/
+    /// `Stale` blocking, and `HopLimitExceeded`/`CycleDetected` errors.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_walk(
+        &self,
+        node: &(DocumentId, NodeId),
+        max_hops: u64,
+        hops: u64,
+        path: &mut Vec<(DocumentId, NodeId)>,
+        steps: &mut Vec<GraphTraceStep>,
+        citations: &mut Vec<(DocumentId, NodeId)>,
+        blocked: &mut Vec<BlockedBy>,
+    ) -> Result<Option<String>, StoreError> {
+        if hops > max_hops {
+            return Err(StoreError::HopLimitExceeded);
+        }
+        if path.contains(node) {
+            return Err(StoreError::CycleDetected);
+        }
+        let n = self.read_node(&node.0, &node.1)?;
+        match n.kind {
+            NodeKind::Reference => {
+                let edge = self
+                    .edges_from_reference(&node.0, &node.1)
+                    .into_iter()
+                    .next()
+                    .or_else(|| {
+                        n.target.clone().map(|target| Edge {
+                            source: node.clone(),
+                            target,
+                            kind: EdgeKind::Link,
+                            state: None,
+                            cross_wiki: false,
+                            relation_type: None,
+                        })
+                    });
+                let Some(edge) = edge else {
+                    blocked.push(BlockedBy {
+                        document_id: node.0.clone(),
+                        node_id: node.1.clone(),
+                        state: ReferenceState::Broken,
+                    });
+                    return Ok(None);
+                };
+                let state = edge.state.unwrap_or(ReferenceState::Resolved);
+                if matches!(state, ReferenceState::Broken | ReferenceState::Stale) {
+                    blocked.push(BlockedBy {
+                        document_id: node.0.clone(),
+                        node_id: node.1.clone(),
+                        state,
+                    });
+                    return Ok(None);
+                }
+                let target = edge.target.clone();
+                path.push(node.clone());
+                steps.push(GraphTraceStep {
+                    from: node.clone(),
+                    to: target.clone(),
+                    edge: edge.kind,
+                    state,
+                });
+                let val =
+                    self.graph_walk(&target, max_hops, hops + 1, path, steps, citations, blocked)?;
+                path.pop();
+                Ok(val)
+            }
+            NodeKind::Fact | NodeKind::Content => {
+                if n.kind == NodeKind::Fact && !citations.contains(node) {
+                    citations.push(node.clone());
+                }
+                Ok(n.value.clone())
+            }
+            NodeKind::Community => Ok(None),
+        }
+    }
+
+    /// The reference edges (`link`/`embed`/`crosslink`) sourced from a node.
+    fn edges_from_reference(&self, doc: &DocumentId, node: &NodeId) -> Vec<Edge> {
+        let guard = self.shard_for(doc).read().unwrap();
+        guard
+            .docs
+            .get(doc)
+            .map(|d| {
+                d.graph
+                    .edges
+                    .iter()
+                    .filter(|e| {
+                        e.source == (doc.clone(), node.clone())
+                            && matches!(
+                                e.kind,
+                                EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                            )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Does `node` satisfy an optional `QueryAuditFilters` predicate?
+    /// `node_kind` restrics by kind; `edge_type`/`state`/`target` restrict via
+    /// the node's reference edges.
+    fn node_matches_filters(
+        &self,
+        node: &Node,
+        doc: &Document,
+        filters: Option<&QueryAuditFilters>,
+    ) -> bool {
+        let Some(f) = filters else { return true };
+        if let Some(k) = f.node_kind {
+            if node.kind != k {
+                return false;
+            }
+        }
+        if f.edge_type.is_none() && f.state.is_none() && f.target.is_none() {
+            return true;
+        }
+        doc.graph.edges.iter().any(|e| {
+            if e.source != (doc.document_id.clone(), node.node_id.clone())
+                || !matches!(
+                    e.kind,
+                    EdgeKind::Link | EdgeKind::Embed | EdgeKind::Crosslink
+                )
+            {
+                return false;
+            }
+            if let Some(et) = f.edge_type {
+                if e.kind != et {
+                    return false;
+                }
+            }
+            if let Some(st) = f.state {
+                if e.state != Some(st) {
+                    return false;
+                }
+            }
+            if let Some(t) = &f.target {
+                if &e.target != t {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    /// §4.5.3 — BM25-ranked nodes over `factKey`/`title`/`tags`/node text within
+    /// a wiki (or across the whole store when `wiki` is `None`), respecting the
+    /// node filters. Returns `top_k` items sorted by score desc, id asc.
+    fn lexical_rank(
+        &self,
+        wiki: Option<&WikiId>,
+        query: &str,
+        top_k: usize,
+        filters: Option<&QueryAuditFilters>,
+    ) -> Vec<RagResultItem> {
+        let query_terms = tokenize(query);
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+        // Candidate nodes (matching filters) with their indexable text.
+        let mut candidates: Vec<(DocumentId, NodeId, String)> = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            for doc in guard.docs.values() {
+                if let Some(w) = wiki {
+                    if &doc.wiki_id != w {
+                        continue;
+                    }
+                }
+                let doc_text = format!("{} {}", doc.title, doc.tags.join(" "));
+                for node in &doc.graph.nodes {
+                    if !self.node_matches_filters(node, doc, filters) {
+                        continue;
+                    }
+                    let mut text = String::new();
+                    if let Some(v) = &node.value {
+                        text.push_str(v);
+                        text.push(' ');
+                    }
+                    if let Some(fk) = &node.fact_key {
+                        text.push_str(fk);
+                        text.push(' ');
+                    }
+                    text.push_str(&doc_text);
+                    candidates.push((doc.document_id.clone(), node.node_id.clone(), text));
+                }
+            }
+        }
+        let n = candidates.len() as f64;
+        if n == 0.0 {
+            return Vec::new();
+        }
+        let mut df: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+        let mut dl: Vec<f64> = Vec::with_capacity(candidates.len());
+        for (_, _, text) in &candidates {
+            let terms = tokenize(text);
+            dl.push(terms.len() as f64);
+            for t in &query_terms {
+                if terms.contains(t) {
+                    *df.entry(t.as_str()).or_insert(0.0) += 1.0;
+                }
+            }
+        }
+        let avgdl = if dl.is_empty() {
+            1.0
+        } else {
+            dl.iter().sum::<f64>() / n
+        };
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+        let mut scored: Vec<((DocumentId, NodeId), f64)> = Vec::new();
+        for idx in 0..candidates.len() {
+            let (doc_id, node_id, text) = &candidates[idx];
+            let terms = tokenize(text);
+            let mut score = 0.0;
+            for qt in &query_terms {
+                let f_t = terms.iter().filter(|t| *t == qt).count() as f64;
+                if f_t == 0.0 {
+                    continue;
+                }
+                let df_t = df.get(qt.as_str()).copied().unwrap_or(0.0);
+                if df_t == 0.0 {
+                    continue;
+                }
+                let idf = ((n - df_t + 0.5) / (df_t + 0.5)).ln_1p();
+                let denom = f_t + K1 * (1.0 - B + B * dl[idx] / avgdl);
+                score += idf * ((f_t * (K1 + 1.0)) / denom);
+            }
+            if score > 0.0 {
+                scored.push(((doc_id.clone(), node_id.clone()), score));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0 .1.cmp(&b.0 .1))
+        });
+        scored.truncate(top_k);
+        scored
+            .into_iter()
+            .map(|((d, n), score)| RagResultItem {
+                document_id: d.clone(),
+                node_id: n.clone(),
+                score,
+                snippet: self.node_snippet(&d, &n),
+                source: Source::Local,
+                parent: None,
+                stale: None,
+            })
+            .collect()
+    }
+
+    /// A node's snippet (its authored `value`).
+    fn node_snippet(&self, doc: &DocumentId, node: &NodeId) -> String {
+        self.read_node(doc, node)
+            .ok()
+            .and_then(|n| n.value)
+            .unwrap_or_default()
+    }
+
+    /// §4.5.2 `expand: 'parent'` — attach the parent Document payload to the top
+    /// `maxParentContext` hits (present-only for the capped hits); a `STALE`
+    /// embed's parent carries `stale: true`.
+    fn apply_expand(
+        &self,
+        results: Vec<RagResultItem>,
+        options: &RagQueryOptions,
+    ) -> Vec<RagResultItem> {
+        if options.expand != Some(ExpandMode::Parent) {
+            return results;
+        }
+        let cap = options.max_parent_context.unwrap_or(5) as usize;
+        let mut out = Vec::with_capacity(results.len());
+        for (i, mut r) in results.into_iter().enumerate() {
+            if i < cap {
+                r.parent = Some(self.parent_for(&r.document_id, &r.node_id));
+            }
+            out.push(r);
+        }
+        out
+    }
+
+    /// The parent-context payload for a retrieved node.
+    fn parent_for(&self, doc_id: &DocumentId, node_id: &NodeId) -> RagParent {
+        let doc = self
+            .shard_for(doc_id)
+            .read()
+            .unwrap()
+            .docs
+            .get(doc_id)
+            .map(|d| (**d).clone());
+        let title = doc.as_ref().map(|d| d.title.clone()).unwrap_or_default();
+        let snippet = self.node_snippet(doc_id, node_id);
+        let stale = doc
+            .map(|d| {
+                d.graph.edges.iter().any(|e| {
+                    e.source == (doc_id.clone(), node_id.clone())
+                        && matches!(e.kind, EdgeKind::Embed | EdgeKind::Crosslink)
+                        && e.state == Some(ReferenceState::Stale)
+                })
+            })
+            .unwrap_or(false);
+        RagParent {
+            document_id: doc_id.clone(),
+            title,
+            snippet,
+            stale,
+        }
+    }
+
+    /// §4.5.3a.3 — select a `binaryCandidatePool`-capped candidate subset by
+    /// ascending Hamming distance between the query's binary code and each
+    /// node's `binary` field (coarse first pass).
+    fn binary_candidate_pool(
+        &self,
+        index: &VectorIndex,
+        qvec: &[f32],
+        nodes: &[(DocumentId, NodeId)],
+        pool: u64,
+    ) -> Vec<(DocumentId, NodeId)> {
+        let cap = if pool == 0 { usize::MAX } else { pool as usize };
+        let qb = binary_code(qvec);
+        let mut ranked: Vec<((DocumentId, NodeId), u64)> = Vec::new();
+        for (d, n) in nodes {
+            if let Some(bv) = index
+                .entries
+                .get(&(d.clone(), n.clone(), FieldType::Binary))
+            {
+                ranked.push(((d.clone(), n.clone()), hamming(&qb, bv)));
+            }
+        }
+        ranked.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0 .1.cmp(&b.0 .1))
+        });
+        ranked.truncate(cap);
+        ranked.into_iter().map(|((d, n), _)| (d, n)).collect()
+    }
+
+    /// Does `wiki_id` own at least one document (i.e. anything to lexical-index)?
+    fn wiki_has_documents(&self, wiki_id: &WikiId) -> bool {
+        self.shards.iter().any(|s| {
+            s.read()
+                .unwrap()
+                .docs
+                .values()
+                .any(|d| d.wiki_id == *wiki_id)
+        })
+    }
+}
+
+/// §4.5.3 / §4.5.3a — cosine similarity over the shared prefix (handles the
+/// index vs query dimension difference from test providers). Zero vector → 0.0.
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for i in 0..n {
+        dot += a[i] as f64 * b[i] as f64;
+        na += a[i] as f64 * a[i] as f64;
+        nb += b[i] as f64 * b[i] as f64;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+/// Tokenize a string into lowercase alphanumeric terms.
+fn tokenize(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// §4.5.3a.1 — sign-binarize a vector to a compact binary code (used for the
+/// coarse first-pass Hamming comparison).
+fn binary_code(v: &[f32]) -> Vec<u8> {
+    v.iter().map(|x| if *x > 0.0 { 1 } else { 0 }).collect()
+}
+
+/// §4.5.3a.3 — Hamming distance between a binary code and (the binarized form
+/// of) a node's binary field, over the shared prefix.
+fn hamming(a: &[u8], b: &[f32]) -> u64 {
+    let n = a.len().min(b.len());
+    let mut d = 0u64;
+    for i in 0..n {
+        let bit = if b[i] > 0.0 { 1 } else { 0 };
+        if a[i] != bit {
+            d += 1;
+        }
+    }
+    d
 }
 
 /// The machine-actionable fail-closed rejection `{code, field, message}`

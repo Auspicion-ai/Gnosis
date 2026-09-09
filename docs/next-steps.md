@@ -59,8 +59,18 @@ the DONE row.
 **§4.4 consistency enforcement DONE (2026-09-09).** Red→green; the §4.4
 adversarial gate found a HIGH AB-BA deadlock (eliminated by the uniform lock-order
 decision LOCK-ORDER-REF-SHARD-SIDECAR) + propagation/report defects, all fixed +
-regression-pinned. Details in the DONE row. Next unit: **§4.5 RAG/agent-memory
-retrieval** (the last core section).
+regression-pinned. Details in the DONE row.
+
+**§4.5 RAG/agent-memory retrieval — GREEN TRIO, but ADVERSARIAL-REJECTED (2026-09-09).**
+Initial red→green landed 226 tests with a clean trio, but the §4.5 adversarial gate
+**correctly rejected** it: the vector/hybrid query modes ran the LEXICAL leg behind a
+`vector`/`hybrid` trace (no real vector leg wired — HIGH 1/2); the retrieval-stack
+fail-states (EmbeddingUnavailable/VectorIndexUnavailable/CompressionFailed/
+HyDEGenerationFailed/MultiQueryExpansionFailed/SubTaskDagFailed) were **unreachable
+dead code** (HIGH 3/4); and several greens were vacuous (stale-parent, profile-value,
+non-contending concurrency — MEDIUM 6/8/9) + cross-wiki vector leakage (MEDIUM 5),
+fabricated `Resolved` walk default (MEDIUM 7), `blocked_by` on non-empty results
+(MEDIUM 10). **Fix pass required** before §4.5 is DONE (see the §4.5 DONE row).
 
 ## OPEN
 
