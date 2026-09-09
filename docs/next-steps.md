@@ -135,7 +135,7 @@ parked (`docs/pending.md`), FS-13/14/15 lexical-index tension in `docs/HANDOFF.m
 
 | Unit | Status | Notes |
 | --- | --- | --- |
-| **The IPC/HTTP engine seam** (spec §4.6.1, §5.1) | pending (next) | The exact IPC/process transport between the shell and Gnosis (the `RagStore` + `ragQuery`/`ragStream`/`engine-status` seam) — **F2** in the spec. The logical API now exists (the §4.6.1 query surface is implemented); the concrete wire/process transport is the F2 design step. Delegate after the documentation gates + before Astrographer wiring. |
+| **The IPC/HTTP engine seam** (spec §4.6.1, §5.1) | proposal-review **PASS** (awaiting user go-ahead) | The §7.2 F2 review (`docs/specs/7-2-f2-review.md`) is **PASS — scoped per Architecture A1**: a **mechanism-agnostic wire contract + encoding layer** (`src/wire/` module + `tests/wire_conformance.rs` + `props_wire.rs`, **zero new deps**), surface = `ragQuery`/`ragStream`/`getEngineStatus` + health (NOT full `RagStore` CRUD), single-event SSE, decode-then-validate for `EngineError`/`TraceUnavailable`, versioned `schemaVersion`/`idFormat` seam for the deferred UUID-v4 id. Awaiting go-ahead to author `docs/specs/engine-wire-contract.md` (SpecWriter) → then red → implementer → adversarial → trio. See the review doc for the full scope + shell-integration defferals. |
 
 ## DONE
 
