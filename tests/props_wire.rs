@@ -16,10 +16,10 @@
 //! |--------|--------|--------|--------|
 //! | P-IM-1 | 60     | P-SM-1 | 40     |
 //! | P-IM-2 | 40     | P-SM-2 | 30     |
-//! | P-IM-3 | 40     | P-SM-3 | 40     |
+//! | P-IM-3 | 60     | P-SM-3 | 40     |
 //! | P-IM-4 | 40     | P-TP-1 | 40     |
 //!
-//! Sum = **330** generated cases (≤ 400). stop-after-5: a row aborts and reports
+//! Sum = **350** generated cases (≤ 400). stop-after-5: a row aborts and reports
 //! at most 5 distinct counterexamples.
 //!
 //! **RED-stage.** All assertions route through the `src/wire/` stub functions
@@ -111,10 +111,12 @@ const PSM2: u64 = 0x50534D32; // "PSM2"
 const PSM3: u64 = 0x50534D33; // "PSM3"
 const PTP1: u64 = 0x50545031; // "PTP1"
 
-/// Per-row budget caps (sum = 330 ≤ 400).
+/// Per-row budget caps (sum = 350 ≤ 400). P-IM-3 is 60 because its deterministic
+/// case count is 51 (21 enumeration + 10 random + 20 from-wire inverse), which
+/// exceeds a 40 budget; the count is fixed and legitimate, so the budget tracks it.
 const B_IM1: u32 = 60;
 const B_IM2: u32 = 40;
-const B_IM3: u32 = 40;
+const B_IM3: u32 = 60;
 const B_IM4: u32 = 40;
 const B_SM1: u32 = 40;
 const B_SM2: u32 = 30;
@@ -175,6 +177,7 @@ fn error_corpus() -> Vec<StoreError> {
         "é".to_string(),
         "漢字😀".to_string(),
         r#"{"code":1,"message":2}"#.to_string(), // JSON-object-shaped: must not be re-read as structure
+        "note: data: marker (SSE line-start fragility)".to_string(), // contains literal "data:"
         "x".repeat(500),
     ];
     for m in msgs {
@@ -184,12 +187,22 @@ fn error_corpus() -> Vec<StoreError> {
 }
 
 /// Four well-formed `RagResult` values, one per `RagTrace` mode, plus a
-/// graph `blocked_by:Some(..)` variant.
+/// graph `blocked_by:Some(..)` variant. The flat result's `query`/`snippet`
+/// intentionally contain the literal `data:` so the SSE framing check (P-IM-4)
+/// cannot pass merely because the fixed corpus lacks that substring.
 fn wellformed_results() -> Vec<RagResult> {
     use QueryMode::{Flat, Hybrid, Vector};
     let flat = RagResult {
-        query: "q".to_string(),
-        results: vec![item("d1", "n1", 0.5)],
+        query: "data: query for 'q'".to_string(),
+        results: vec![RagResultItem {
+            document_id: did("d1"),
+            node_id: nid("n1"),
+            score: 0.5,
+            snippet: "snippet with data: marker".to_string(),
+            source: Source::Local,
+            parent: None,
+            stale: None,
+        }],
         engine: "gnosis".to_string(),
         citations: vec![(did("d1"), nid("n1"))],
         trace: RagTrace::Flat(TraceDescriptor {
@@ -406,7 +419,12 @@ fn p_im_3_code_unique() {
         let a = &errors[rng.below(errors.len() as u64) as usize];
         let b = &errors[rng.below(errors.len() as u64) as usize];
         let a_code = a.wire_code();
-        if a != b && a_code == b.wire_code() {
+        // A code "collision" means two *distinct variants* sharing one code. Two
+        // `ValidationError` values carrying different messages are the SAME variant
+        // (the §5 taxonomy is per-variant, not per-value), so they are required to
+        // share the fixed `"validation_error"` code — compare by variant
+        // discriminant, not value `==`.
+        if std::mem::discriminant(a) != std::mem::discriminant(b) && a_code == b.wire_code() {
             let cex = format!("collision {a:?}/{b:?} -> {a_code}");
             if !cexes.contains(&cex) {
                 cexes.push(cex);
@@ -480,9 +498,14 @@ fn p_im_4_sse_roundtrip() {
         if !frame.ends_with("\n\n") {
             cexes.push(format!("frame lacks terminal blank line: {frame:?}"));
         }
-        if frame.matches("data:").count() != 1 {
+        // Count only lines that START with `data: ` — a payload whose JSON
+        // contains the literal `data:` (e.g. a ValidationError message, query, or
+        // snippet) must NOT trip the framing check. The frame has exactly one
+        // `data:` line regardless of how many `data:` substrings the body carries.
+        let data_lines = frame.lines().filter(|l| l.starts_with("data: ")).count();
+        if data_lines != 1 {
             cexes.push(format!(
-                "frame must contain exactly one data: line: {frame:?}"
+                "frame must contain exactly one 'data: ' line: {frame:?}"
             ));
         }
         // Event value == data JSON "type".

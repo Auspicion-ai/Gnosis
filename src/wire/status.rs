@@ -1,8 +1,5 @@
 //! §7.2 F2 — schemaVersion-aware health serialization.
 //! Contract: `docs/specs/engine-wire-contract.md` §9.
-//!
-//! **RED-stage stub skeleton** — the struct is real (serde derives), but the
-//! `health` projection body is a placeholder the Implementer fills.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +24,12 @@ pub struct HealthReport {
 /// version + `opaque-string-v1` id format; maps state/version/subsystems/
 /// last_error verbatim (faithful projection, never invents a `last_error`).
 pub fn health(status: &EngineStatus) -> HealthReport {
-    // RED-stage stub: the struct shape is real so the type-checks pass, but the
-    // projection body is a placeholder the Implementer fills.
-    let _ = (status, current_schema_version(), ID_FORMAT_OPAQUE_STRING_V1);
-    todo!("RED-stage stub: status::health")
+    HealthReport {
+        schema_version: current_schema_version(),
+        id_format: ID_FORMAT_OPAQUE_STRING_V1.to_string(),
+        state: status.state,
+        version: status.version.clone(),
+        subsystems: status.subsystems.clone(),
+        last_error: status.last_error.clone(),
+    }
 }

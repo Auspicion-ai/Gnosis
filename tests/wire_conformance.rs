@@ -111,6 +111,20 @@ fn flat_trace() -> RagTrace {
     })
 }
 
+fn hybrid_trace() -> RagTrace {
+    RagTrace::Hybrid(HybridTrace {
+        mode: QueryMode::Hybrid,
+        engine: "gnosis".to_string(),
+        legs: vec![
+            "graph".to_string(),
+            "vector".to_string(),
+            "lexical".to_string(),
+        ],
+        top_k: 10,
+        source: Source::Local,
+    })
+}
+
 fn item(doc: &str, node: &str, score: f64) -> RagResultItem {
     RagResultItem {
         document_id: did(doc),
@@ -208,17 +222,55 @@ fn wellformed_results() -> Vec<RagResult> {
 // §5 — StoreError::wire_code (exhaustive over 21) + code_table
 // ---------------------------------------------------------------------------
 
-/// Every one of the 21 variants maps to the exact §5 wire-code string.
+/// The PascalCase variant name of a `StoreError` value, so `wire_code` is
+/// checked against the §5 table **by name** rather than positionally. The enum
+/// (`src/store/mod.rs`) is declared in fail-state order (after `UnresolvedReference`
+/// comes `CommunityNotFound`, `CycleDetected`, `HopLimitExceeded`, `EngineUnavailable`, …)
+/// while the §5 table lists them in its own order (after `UnresolvedReference` comes
+/// `EngineUnavailable`, `EngineError`, `TraceUnavailable`, … `CommunityNotFound` near
+/// the end). `wire_code` is a per-variant map, so pairing the two lists positionally
+/// would pair wrong variants with wrong codes; looking up by name is order-independent.
+fn store_error_variant_name(e: &StoreError) -> &'static str {
+    match e {
+        StoreError::DocumentNotFound => "DocumentNotFound",
+        StoreError::WikiNotFound => "WikiNotFound",
+        StoreError::ValidationError(_) => "ValidationError",
+        StoreError::ConflictError => "ConflictError",
+        StoreError::DocumentInUse => "DocumentInUse",
+        StoreError::InvalidState => "InvalidState",
+        StoreError::UnresolvedReference => "UnresolvedReference",
+        StoreError::CommunityNotFound => "CommunityNotFound",
+        StoreError::CycleDetected => "CycleDetected",
+        StoreError::HopLimitExceeded => "HopLimitExceeded",
+        StoreError::EngineUnavailable => "EngineUnavailable",
+        StoreError::EngineError => "EngineError",
+        StoreError::TraceUnavailable => "TraceUnavailable",
+        StoreError::EmbeddingUnavailable => "EmbeddingUnavailable",
+        StoreError::VectorIndexUnavailable => "VectorIndexUnavailable",
+        StoreError::LexicalIndexUnavailable => "LexicalIndexUnavailable",
+        StoreError::RerankerUnavailable => "RerankerUnavailable",
+        StoreError::CompressionFailed => "CompressionFailed",
+        StoreError::HyDEGenerationFailed => "HyDEGenerationFailed",
+        StoreError::MultiQueryExpansionFailed => "MultiQueryExpansionFailed",
+        StoreError::SubTaskDagFailed => "SubTaskDagFailed",
+    }
+}
+
+/// Every one of the 21 variants maps to the exact §5 wire-code string (looked up
+/// by variant name, so §5-table order vs enum declaration order cannot mismatch).
 #[test]
 fn wire_code_matches_contract_table_exhaustive() {
-    for (e, expected) in all_store_errors()
-        .into_iter()
-        .zip(WIRE_CODES.iter().map(|(_, c)| *c))
-    {
+    for e in all_store_errors() {
+        let name = store_error_variant_name(&e);
+        let expected = WIRE_CODES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("§5 table has no row for variant {name}"))
+            .1;
         assert_eq!(
             e.wire_code(),
             expected,
-            "wire_code({e:?}) must equal the §5 pinned code"
+            "wire_code({e:?}) must equal the §5 pinned code for {name}"
         );
     }
 }
@@ -671,7 +723,8 @@ fn health_deterministic_and_maps_fields() {
 }
 
 /// A DEGRADED engine with an unavailable embedding subsystem + a `last_error`
-/// surfaces `last_error: Some(...)` exactly as the input.
+/// surfaces `last_error: Some(...)` exactly as the input and projects every
+/// subsystem flag faithfully (embedding stays false, reranker stays true).
 #[test]
 fn health_degaded_last_error_present_and_mirrors_input() {
     let s = EngineStatus {
@@ -689,8 +742,14 @@ fn health_degaded_last_error_present_and_mirrors_input() {
     };
     let h = status::health(&s);
     assert_eq!(h.state, EngineState::Degraded);
-    assert!(!h.subsystems.embedding);
-    assert!(!h.subsystems.reranker, "reranker stays true");
+    assert!(
+        !h.subsystems.embedding,
+        "embedding was false in the input and stays false (faithful projection)"
+    );
+    assert!(
+        h.subsystems.reranker,
+        "reranker was true in the input and stays true (faithful projection)"
+    );
     assert_eq!(
         h.last_error,
         Some("a non-core subsystem (embedding/reranker) is unavailable".to_string())
@@ -788,6 +847,43 @@ fn envelope_from_json_does_not_validate_id_format_or_schema() {
     assert!(
         ok.is_ok(),
         "from_json only shape-checks; schema/id_format validation is the decode step"
+    );
+}
+
+/// `from_json` must reject a `schemaVersion` outside the `u32` range rather than
+/// truncate it: `4294967297` (2^32 + 1) must not wrap to a passable `1`, and a
+/// negative `-1` must be rejected outright.
+#[test]
+fn envelope_from_json_rejects_oversized_and_negative_schema_version() {
+    for bad in [
+        r#"{"schemaVersion":4294967297,"idFormat":"opaque-string-v1","payload":{}}"#,
+        r#"{"schemaVersion":-1,"idFormat":"opaque-string-v1","payload":{}}"#,
+    ] {
+        match Envelope::from_json(bad) {
+            Err(DecodeError::InvalidEnvelope(_)) => {}
+            Ok(env) => panic!(
+                "schemaVersion must be rejected, got Ok(schema={})",
+                env.schema_version
+            ),
+            other => panic!("expected InvalidEnvelope, got {other:?}"),
+        }
+    }
+}
+
+/// `decode_chunk_payload` accepts `RagChunk::Done` only for the exact
+/// `{"type":"done"}` shape; extra keys make the done frame malformed
+/// (A1) rather than silently ignored.
+#[test]
+fn decode_done_with_extra_keys_is_malformed() {
+    let bad = serde_json::json!({ "type": "done", "garbage": true });
+    match decode::decode_chunk_payload(&bad) {
+        Err(DecodeError::InvalidEnvelope(_)) => {}
+        other => panic!("expected InvalidEnvelope, got {other:?}"),
+    }
+    // The exact canonical shape still decodes to `Ok(RagChunk::Done)`.
+    assert_eq!(
+        decode::decode_chunk_payload(&serde_json::json!({ "type": "done" })),
+        Ok(RagChunk::Done)
     );
 }
 
@@ -988,5 +1084,278 @@ fn v9_decode_then_validate_routes_exact() {
     assert_eq!(
         decode::outcome_of(DecodeError::InvalidJson("x".into())),
         RagChunk::Error(StoreError::EngineError)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial negative-generator probes (audit-recommended; assert the current
+// `src/wire/` behavior per `engine-wire-contract.md` §7/§8/§9/§13). Each asserts
+// a real error variant / faithful-projection on a crafted bad/contradictory input
+// that the happy-path corpus does not exercise.
+// ---------------------------------------------------------------------------
+
+/// P-NEG-1 — mode-mismatched trace + `blocked_by`: a Flat and a Hybrid trace
+/// carrying `blocked_by: Some(..)` is rejected by `validate_rag_result` with
+/// `BlockedByWithoutGraphTrace`, surfaces as `ValidationFailed(_)` on both the
+/// `decode_result` and `decode_chunk` paths, and `outcome_of` maps it to the
+/// `EngineError` outcome (§7).
+#[test]
+fn probe_blocked_by_without_graph_across_flat_and_hybrid() {
+    for trace in [flat_trace(), hybrid_trace()] {
+        let mut r = v5_result();
+        r.trace = trace;
+        r.blocked_by = Some(vec![BlockedBy {
+            document_id: did("d1"),
+            node_id: nid("n1"),
+            state: ReferenceState::Broken,
+        }]);
+        // Direct validator.
+        assert_eq!(
+            decode::validate_rag_result(&r),
+            Err(ValidationFailure::BlockedByWithoutGraphTrace),
+            "blocked_by with a non-Graph trace must be rejected"
+        );
+        // decode_result (envelope path) → ValidationFailed(BlockedByWithoutGraphTrace).
+        assert!(
+            matches!(
+                codecs::decode_result(&codecs::encode_result(&r)),
+                Err(DecodeError::ValidationFailed(
+                    ValidationFailure::BlockedByWithoutGraphTrace
+                ))
+            ),
+            "decode_result must surface BlockedByWithoutGraphTrace"
+        );
+        // decode_chunk (chunk path) → same.
+        assert!(
+            matches!(
+                codecs::decode_chunk(&codecs::encode_chunk(&RagChunk::Result(r))),
+                Err(DecodeError::ValidationFailed(
+                    ValidationFailure::BlockedByWithoutGraphTrace
+                ))
+            ),
+            "decode_chunk must surface BlockedByWithoutGraphTrace"
+        );
+        // outcome_of → EngineError route.
+        assert_eq!(
+            decode::outcome_of(DecodeError::ValidationFailed(
+                ValidationFailure::BlockedByWithoutGraphTrace
+            )),
+            RagChunk::Error(StoreError::EngineError)
+        );
+    }
+}
+
+/// P-NEG-1b — trace-variant↔descriptor `mode` mismatch (a "flat result carrying
+/// a HybridTrace") is NOT a pinned validation fail-state: the wire is transparent
+/// to it when `blocked_by` is None, so it round-trips and validates `Ok` (the
+/// current correct behavior — the contract reserves only MissingTrace /
+/// WrongEngine / BlockedByWithoutGraphTrace).
+#[test]
+fn probe_trace_mode_mismatch_is_transparent_not_a_failure() {
+    let mut r = v5_result();
+    r.trace = RagTrace::Hybrid(HybridTrace {
+        mode: QueryMode::Vector, // contradicts the Hybrid variant's mode — not validated
+        engine: "gnosis".to_string(),
+        legs: vec!["graph".to_string()],
+        top_k: 1,
+        source: Source::Local,
+    });
+    assert_eq!(decode::validate_rag_result(&r), Ok(()));
+    assert_eq!(
+        codecs::decode_result(&codecs::encode_result(&r)),
+        Ok(r),
+        "codec is transparent to trace-variant/mode mismatch"
+    );
+}
+
+/// P-NEG-2 — unknown schema_version / id_format are never treated as schema-1
+/// (coordinated with the implementer's A2): over-sized / negative `schemaVersion`
+/// is rejected at the envelope layer, a well-formed-but-unknown `u32` schema is
+/// rejected at decode (`UnsupportedSchemaVersion`), and the known non-canonical
+/// `id_format:"uuid-v4"` is rejected (`UnknownIdFormat`) — each maps to the
+/// `EngineError` outcome.
+#[test]
+fn probe_unknown_schema_version_and_id_format_are_errors() {
+    // Over-sized / negative schemaVersion: rejected at from_json (A2 — no truncation).
+    assert!(
+        Envelope::from_json(
+            r#"{"schemaVersion":4294967297,"idFormat":"opaque-string-v1","payload":{}}"#
+        )
+        .is_err(),
+        "schemaVersion 2^32+1 must be rejected, not truncated"
+    );
+    assert!(
+        Envelope::from_json(r#"{"schemaVersion":-1,"idFormat":"opaque-string-v1","payload":{}}"#)
+            .is_err(),
+        "negative schemaVersion must be rejected"
+    );
+    // A valid-u32-but-unknown schema (99) parses, but the decode step rejects it.
+    let env99 = Envelope::from_json(
+        r#"{"schemaVersion":99,"idFormat":"opaque-string-v1","payload":{"type":"done"}}"#,
+    )
+    .expect("99 is a valid u32 — from_json only shape-checks");
+    match codecs::decode_chunk(&env99) {
+        Err(DecodeError::UnsupportedSchemaVersion(99)) => {}
+        other => panic!("expected UnsupportedSchemaVersion(99), got {other:?}"),
+    }
+    assert_eq!(
+        decode::outcome_of(DecodeError::UnsupportedSchemaVersion(99)),
+        RagChunk::Error(StoreError::EngineError)
+    );
+    // Known non-canonical id_format → UnknownIdFormat → EngineError.
+    let envv4 = Envelope::from_json(
+        r#"{"schemaVersion":1,"idFormat":"uuid-v4","payload":{"type":"done"}}"#,
+    )
+    .expect("id_format is not shape-validated at from_json");
+    match codecs::decode_chunk(&envv4) {
+        Err(DecodeError::UnknownIdFormat(s)) => assert_eq!(s, "uuid-v4"),
+        other => panic!("expected UnknownIdFormat, got {other:?}"),
+    }
+    assert_eq!(
+        decode::outcome_of(DecodeError::UnknownIdFormat("uuid-v4".into())),
+        RagChunk::Error(StoreError::EngineError)
+    );
+}
+
+/// P-NEG-3 — health is a faithful projection on contradictory input (§9): a
+/// `Degraded` status that (contradictorily) has ALL subsystem flags `true` still
+/// mirrors every flag and the `last_error` exactly; a `Ready` status carrying
+/// `last_error: Some(..)` keeps it (never clears it).
+#[test]
+fn probe_health_faithful_on_contradictory_input() {
+    let degraded_all_true = EngineStatus {
+        state: EngineState::Degraded,
+        version: "v".to_string(),
+        subsystems: all_true_subsystems(), // contradictory: Degraded but every subsystem up
+        last_error: Some("contradictory: degraded but every subsystem is up".to_string()),
+    };
+    let h = status::health(&degraded_all_true);
+    assert_eq!(h.state, EngineState::Degraded);
+    assert_eq!(
+        h.subsystems, degraded_all_true.subsystems,
+        "mirrors every flag exactly (incl. the contradictory all-true mask)"
+    );
+    assert_eq!(
+        h.last_error,
+        Some("contradictory: degraded but every subsystem is up".to_string())
+    );
+
+    let ready_with_error = EngineStatus {
+        state: EngineState::Ready,
+        version: "v".to_string(),
+        subsystems: all_true_subsystems(),
+        last_error: Some("carried across states".to_string()),
+    };
+    let h2 = status::health(&ready_with_error);
+    assert_eq!(h2.state, EngineState::Ready);
+    assert_eq!(
+        h2.last_error,
+        Some("carried across states".to_string()),
+        "faithful projection must not clear a Some last_error on a Ready status"
+    );
+    assert_eq!(h2.subsystems, ready_with_error.subsystems);
+}
+
+/// P-NEG-4 — SSE `event:`/data-`type` mismatch across ALL three mismatched ordered
+/// pairs, each → `EventTypeMismatch` (§8): (result, done), (done, error),
+/// (error, valid-result-body).
+#[test]
+fn probe_sse_event_data_mismatch_all_ordered_pairs() {
+    // event:result vs data type "done".
+    let f1 = "event: result\ndata: {\"type\":\"done\"}\n\n";
+    match sse::decode_event(f1) {
+        Err(DecodeError::EventTypeMismatch { event, data_type }) => {
+            assert_eq!(event, "result");
+            assert_eq!(data_type, "done");
+        }
+        other => panic!("expected EventTypeMismatch(result/done), got {other:?}"),
+    }
+    // event:done vs data type "error".
+    let f2 = "event: done\ndata: {\"type\":\"error\",\"code\":\"conflict\",\"message\":\"x\"}\n\n";
+    match sse::decode_event(f2) {
+        Err(DecodeError::EventTypeMismatch { event, data_type }) => {
+            assert_eq!(event, "done");
+            assert_eq!(data_type, "error");
+        }
+        other => panic!("expected EventTypeMismatch(done/error), got {other:?}"),
+    }
+    // event:error vs a valid result body (data type "result").
+    let body = serde_json::to_string(&v5_result()).expect("Serialize");
+    let f3 = format!("event: error\ndata: {{\"type\":\"result\",\"result\":{body}}}\n\n");
+    match sse::decode_event(&f3) {
+        Err(DecodeError::EventTypeMismatch { event, data_type }) => {
+            assert_eq!(event, "error");
+            assert_eq!(data_type, "result");
+        }
+        other => panic!("expected EventTypeMismatch(error/result), got {other:?}"),
+    }
+}
+
+/// P-NEG-5 — error-codec edges (§5/§6): a `validation_error` codec input with NO
+/// `message` field yields no variant (`from_wire` → `None`) so `decode_error` is
+/// `UnknownCode`; an unknown / non-canonical code is `UnknownCode`.
+#[test]
+fn probe_error_codec_missing_message_and_unknown_code() {
+    // validation_error with no message → from_wire → None → decode_error UnknownCode.
+    assert_eq!(from_wire("validation_error", None), None);
+    let env_no_msg = Envelope {
+        schema_version: current_schema_version(),
+        id_format: ID_FORMAT_OPAQUE_STRING_V1.to_string(),
+        payload: serde_json::json!({"code": "validation_error"}),
+    };
+    match codecs::decode_error(&env_no_msg) {
+        Err(DecodeError::UnknownCode(c)) => assert_eq!(c, "validation_error"),
+        other => panic!("expected UnknownCode(validation_error), got {other:?}"),
+    }
+    // Unknown / non-canonical code.
+    match codecs::decode_error(&Envelope::with_payload(serde_json::json!({
+        "code": "bogus",
+        "message": "x"
+    }))) {
+        Err(DecodeError::UnknownCode(c)) => assert_eq!(c, "bogus"),
+        other => panic!("expected UnknownCode(bogus), got {other:?}"),
+    }
+}
+
+/// P-NEG-5b — a `ValidationError` whose `message` contains the reserved-looking
+/// key substrings `"code"`/`"message"`/`"data:"` survives the codec round-trip
+/// byte-for-byte (field escaping is not re-read as structure).
+#[test]
+fn probe_validation_error_message_with_code_message_data_survives() {
+    let msg = r#"{"code":1,"message":2,"note":"data: marker"}"#.to_string();
+    let err = StoreError::ValidationError(msg.clone());
+    assert_eq!(
+        from_wire("validation_error", Some(&msg)),
+        Some(err.clone()),
+        "from_wire must preserve a data:-bearing message verbatim"
+    );
+    assert_eq!(
+        codecs::decode_error(&codecs::encode_error(&err)),
+        Ok(err.clone()),
+        "error codec must round-trip a data:-bearing message"
+    );
+    assert_eq!(
+        codecs::decode_chunk(&codecs::encode_chunk(&RagChunk::Error(err.clone()))),
+        Ok(RagChunk::Error(err)),
+        "chunk codec must round-trip a data:-bearing message"
+    );
+}
+
+/// P-NEG-6 — done-chunk strictness regression (ties to implementer A1): the SSE
+/// path must also reject a `{"type":"done"}` body carrying an extra field rather
+/// than decode to `Ok(Done)`.
+#[test]
+fn probe_done_chunk_strictness_via_sse_path() {
+    let extra = "event: done\ndata: {\"type\":\"done\",\"x\":1}\n\n";
+    match sse::decode_event(extra) {
+        Err(DecodeError::InvalidEnvelope(_)) => {}
+        other => {
+            panic!("expected InvalidEnvelope for extra-key done, got {other:?} — A1 must be landed")
+        }
+    }
+    // The exact canonical done frame still decodes.
+    assert_eq!(
+        sse::decode_event("event: done\ndata: {\"type\":\"done\"}\n\n"),
+        Ok(RagChunk::Done)
     );
 }

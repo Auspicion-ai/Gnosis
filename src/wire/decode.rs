@@ -1,9 +1,9 @@
 //! §7.2 F2 — decode-then-validate (the FS-9 / FS-10 realization).
 //! Contract: `docs/specs/engine-wire-contract.md` §7.
-//!
-//! **RED-stage stub skeleton** — bodies are placeholders the Implementer fills.
 
-use crate::store::{RagChunk, RagResult};
+use crate::store::RagChunk;
+use crate::store::{RagResult, RagTrace, StoreError};
+use crate::wire::error::from_wire;
 
 /// A decode/validation failure surfaced by the wire layer (§7).
 #[derive(Debug, Clone, PartialEq)]
@@ -43,26 +43,81 @@ pub enum ValidationFailure {
 /// entry): structurally malformed → `InvalidJson`; well-formed but missing
 /// `trace` → `MissingTrace`; otherwise `Ok`.
 pub fn decode_rag_result(json: &serde_json::Value) -> Result<RagResult, DecodeError> {
-    let _ = json;
-    todo!("RED-stage stub: decode::decode_rag_result")
+    let obj = json
+        .as_object()
+        .ok_or_else(|| DecodeError::InvalidJson("result body must be a JSON object".to_string()))?;
+    // A well-formed result body that lacks a `trace` is the FS-10 route.
+    if !obj.contains_key("trace") {
+        return Err(DecodeError::MissingTrace);
+    }
+    serde_json::from_value::<RagResult>(json.clone())
+        .map_err(|e| DecodeError::InvalidJson(e.to_string()))
 }
 
 /// Post-decode validation of a `RagResult` against the §4.6.1 / §4.3.3
 /// invariants (`engine == "gnosis"`, trace present, `blocked_by` ⇒
 /// `RagTrace::Graph`).
 pub fn validate_rag_result(res: &RagResult) -> Result<(), ValidationFailure> {
-    let _ = res;
-    todo!("RED-stage stub: decode::validate_rag_result")
+    if res.engine != "gnosis" {
+        return Err(ValidationFailure::WrongEngine(res.engine.clone()));
+    }
+    if res.blocked_by.is_some() && !matches!(res.trace, RagTrace::Graph(_)) {
+        return Err(ValidationFailure::BlockedByWithoutGraphTrace);
+    }
+    Ok(())
 }
 
 /// Decode the canonical chunk JSON (envelope payload or SSE data line).
 pub fn decode_chunk_payload(payload: &serde_json::Value) -> Result<RagChunk, DecodeError> {
-    let _ = payload;
-    todo!("RED-stage stub: decode::decode_chunk_payload")
+    let obj = payload.as_object().ok_or_else(|| {
+        DecodeError::InvalidEnvelope("chunk payload must be a JSON object".to_string())
+    })?;
+    let ty = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DecodeError::UnknownType("payload has no string \"type\"".to_string()))?;
+    match ty {
+        // §4.2 pins `RagChunk::Done` as exactly `{"type":"done"}` (a single
+        // `type` key whose value is "done"). Any extra key — or a duplicated /
+        // mis-shapen body — is a malformed done frame (the §13 cross-cutting
+        // rule: decodes to `Ok(Done)` only when the payload is exactly
+        // `{"type":"done"}`, else `InvalidEnvelope`/`UnknownType`).
+        "done" => {
+            if obj.len() == 1 {
+                Ok(RagChunk::Done)
+            } else {
+                Err(DecodeError::InvalidEnvelope(
+                    "done chunk must be exactly {\"type\":\"done\"}".to_string(),
+                ))
+            }
+        }
+        "error" => {
+            let code = obj.get("code").and_then(|v| v.as_str()).ok_or_else(|| {
+                DecodeError::InvalidJson("error payload missing \"code\"".to_string())
+            })?;
+            let message = obj.get("message").and_then(|v| v.as_str());
+            let err = from_wire(code, message)
+                .ok_or_else(|| DecodeError::UnknownCode(code.to_string()))?;
+            Ok(RagChunk::Error(err))
+        }
+        "result" => {
+            let body = obj.get("result").ok_or_else(|| {
+                DecodeError::InvalidJson("result payload missing \"result\"".to_string())
+            })?;
+            let res = decode_rag_result(body)?;
+            validate_rag_result(&res).map_err(DecodeError::ValidationFailed)?;
+            Ok(RagChunk::Result(res))
+        }
+        other => Err(DecodeError::UnknownType(other.to_string())),
+    }
 }
 
 /// Map a `DecodeError` to the wire outcome chunk (FS-9 / FS-10).
 pub fn outcome_of(e: DecodeError) -> RagChunk {
-    let _ = e;
-    todo!("RED-stage stub: decode::outcome_of")
+    match e {
+        // FS-10: a well-formed result body with no trace → TraceUnavailable.
+        DecodeError::MissingTrace => RagChunk::Error(StoreError::TraceUnavailable),
+        // FS-9: every other decode failure → EngineError.
+        _ => RagChunk::Error(StoreError::EngineError),
+    }
 }
