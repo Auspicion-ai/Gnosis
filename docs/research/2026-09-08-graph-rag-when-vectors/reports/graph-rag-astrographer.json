@@ -1,0 +1,40 @@
+{
+  "slug": "graph-rag-astrographer",
+  "title": "Application to Astrographer (graphical RAG engine + document store/wiki)",
+  "tier": "MUST",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/pdf/2404.16130",
+    "https://arxiv.org/abs/2502.11371v3",
+    "https://neo4j.com/blog/developer/graphrag-field-guide-rag-patterns/",
+    "https://www.progressiverobot.com/2026/05/17/graph-enhanced-rag/",
+    "https://osfoundry.io/articles/knowledge-graph-rag-hybrid-when-and-how",
+    "https://milvus.io/blog/vector-graph-rag-without-graph-database.md",
+    "https://www.learnwithparam.com/blog/hybrid-retrieval-rag-vector-graph-search",
+    "https://www.microsoft.com/en-us/research/blog/graphrag-improving-global-search-via-dynamic-community-selection/",
+    "https://arxiv.org/pdf/2510.02827",
+    "https://arxiv.org/html/2504.08893v1",
+    "https://arxiv.org/html/2603.24925v3",
+    "https://arxiv.org/abs/2608.29753",
+    "https://arxiv.org/abs/2607.22597",
+    "https://docs.trustgraph.ai/overview/explainability.html",
+    "https://github.com/trustgraph-ai/trustgraph/blob/4e3bd85a/docs/tech-specs/query-time-explainability.md",
+    "https://doi.org/10.1109/acdsa67686.2026.11468256",
+    "https://neo4j.com/blog/developer/graph-data-models-rag-applications/",
+    "https://bigdataboutique.com/blog/knowledge-graphs-meet-rag-practical-integration-guide",
+    "https://venturebeat.com/orchestration/stop-graphing-everything-when-graphrag-actually-beats-vector-rag",
+    "https://airbyte.com/agentic-data/graph-rag-vs-vector-rag",
+    "https://www.tigergraph.com/blog/graphrag-vs-vector-rag/"
+  ],
+  "keyFindings": [
+    "Astrographer's data model is already a knowledge graph: `fact`/`reference`/`content` nodes, `link`/`embed` edges, and node/edge properties (astrographer.md §4.2) — so Graph RAG is a retrieval behavior over the existing substrate, not a foreign addition.",
+    "The graph-enhanced vector search axis is already in the suite: Incanter's hybrid graph-tension + vector query (incanter.md §4.8) and Zodiac's graph/vector/hybrid modes (zodiac.md §4.3.2) are the vector+graph fusion seam.",
+    "The strongest Graph RAG fit is explainability/traceability: the consistency model already tracks every link/embed to its target (astrographer.md §4.2.3), so extending ragQuery results with a trace path directly answers the governance/sourcing point at low cost.",
+    "Relationship-aware, multi-hop retrieval over the reference→fact graph (topological resolution) is the core MUST-HAVE, consistent with the DAG-RAG research (dag-rag-research-notes.md §4) and D2 (runs locally over the Provident graph).",
+    "Expensive global techniques — community summaries (Microsoft GraphRAG global search) and dynamic graph query generation — are PARKED for D2 local-first cost/latency reasons and overlap with already-parked DAG-RAG items.",
+    "Secondary consumers inherit the graph layer indirectly: Familiar routes research through Astrographer's rag_query (familiar.md §4.3.3); Solomon and Mystery are PARKED until their search/crosslink semantics finalize."
+  ],
+  "recommendation": "MUST",
+  "summary": "Graph RAG is not a foreign technique for the Auspicion Suite: Astrographer and Zodiac are already graphical RAG engines over knowledge-graph-shaped data (nodes/edges/properties). The concrete MUST/SHOULD work is graph-enhanced retrieval over Astrographer's reference graph (topological reference→fact resolution) plus an explainability/trace surface on RAG results, reusing the provenance the consistency model already tracks. Expensive global techniques (community summaries, dynamic graph query generation) stay PARKED for D2 local-first cost reasons."
+}

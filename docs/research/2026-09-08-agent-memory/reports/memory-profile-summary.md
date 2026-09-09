@@ -1,0 +1,66 @@
+# Memory Profile Summary — 3-Layer Memory
+
+**Topic:** 3-layer memory: profile summary regenerated from the facts table for a concise current picture
+**Run ID:** research-worker-memory-profile-summary
+**Topic ID:** memory-profile-summary
+**Completeness:** complete
+
+## Summary
+
+This topic specifies a three-layer memory architecture in which a concise, human- and model-readable "profile summary" is not stored as a hand-maintained blob but is **DERIVED** — regenerated on demand — from a canonical "facts table" (the source-of-truth layer). The three layers are:
+
+1. **Durable facts layer** — the facts table: discrete, structured, individually verifiable facts about the user, the domain, or the tool's state.
+2. **Derived summary layer** — the profile summary: a condensed natural-language or structured digest that is recomputed from the facts table whenever the underlying facts change or on read.
+3. **Working/context layer** — the ephemeral, task-scoped context that pulls in the summary plus only the facts relevant to the current turn.
+
+The key design property is that the summary is a **projection of the facts table**, never an independent store — so there is a single source of truth, no drift between the summary and the facts, and the summary always reflects the "current picture." This mirrors the MemGPT/Letta memory-block model (core memory blocks vs. archival memory), the Oracle "persistent memory + derived context" two-layer pattern, and the redis agent-memory-server "summary views" concept. The pattern is valuable for the Auspicion Suite because each tool accumulates user/domain facts over time and needs a compact, always-current digest to inject into context without bloating the prompt or going stale.
+
+## State of the Art
+
+The state of the art for agent memory has converged on layered, derived-context designs rather than single monolithic memory stores. MemGPT (Packer et al., arXiv:2310.08560) introduced the operating-system metaphor: a small "core memory" (always in context) plus a large "archival memory" (external storage paged in on demand), with an LLM-driven memory manager deciding what to evict, summarize, or recall. Its successor, Letta, formalizes this as memory blocks — a fixed set of core memory blocks (e.g., persona, human, tools) that are always injected, plus archival memory blocks that are retrieved by relevance; the core blocks are themselves editable and can be regenerated. The Oracle "Persistent Memory and Derived Context" pattern (blogs.oracle.com/developers) is the closest published articulation of the exact topic: it separates a persistent memory store (facts) from a derived context (a summary/embedding computed from that store) so that the derived layer is always consistent with the source. The redis agent-memory-server documents "summary views" — precomputed or on-demand summaries over a memory store that give a concise current picture without re-reading every fact. Neo4j's agent-memory project (memory-types.adoc) distinguishes episodic, semantic, and procedural memory types and shows how a semantic layer (facts/entities) can be queried to produce a profile. Cloudflare Agent Memory and SurrealDB agent-memory both ship "profiles" as derived, queryable views over stored facts. Recent arXiv work (2603.29194, 2603.21564, 2512.12818) evaluates multi-layered memory for long-term context retention and reflection, confirming that derived summaries improve retention and reduce context cost. The consensus design: store facts canonically; derive the summary; keep the summary in the always-injected context layer; and regenerate the summary when facts change (event-driven) or on read (lazy), never by manual editing of the summary in isolation.
+
+## Key Concepts Glossary
+
+- **Facts table (source-of-truth layer):** a structured, append-only or upsertable store of discrete, individually verifiable facts (e.g., "user prefers X", "user's timezone is Y", "last project was Z"). Each fact is a small, self-contained record with a stable identity so it can be added, updated, or invalidated independently. This is the canonical layer; nothing else is authoritative.
+- **Profile summary (derived layer):** a concise digest — natural-language paragraph, structured JSON, or a compact list — that condenses the facts table into a "current picture." It is a projection of the facts table, regenerated from it, never an independent store. It is what gets injected into the working context so the model sees a compact, current view.
+- **Working/context layer (ephemeral):** the task-scoped context for the current turn. It holds the profile summary plus only the facts relevant to the immediate task, plus conversation/task state. It is rebuilt per turn and is not a durable store.
+- **Regeneration (the core mechanism):** recomputing the profile summary from the facts table. Two triggers: event-driven (regenerate immediately when a fact is added/updated/invalidated) or lazy/on-read (regenerate when the summary is requested or when the facts table's revision counter changes). The summary is cached only as a derived artifact keyed to a facts-table revision, so staleness is detectable.
+- **Single source of truth / no drift:** because the summary is derived, the summary and the facts can never disagree; any edit to the facts is reflected in the next regeneration. This eliminates the classic bug of a hand-edited profile going stale.
+- **Revision counter / fingerprint:** a monotonically increasing value or content hash on the facts table used to detect whether a cached summary is current; if the revision differs, regenerate.
+- **Core vs. archival memory (MemGPT/Letta):** core memory blocks are always in context (the profile summary lives here); archival memory is external and paged in by relevance (the full facts table lives here).
+- **Derived context (Oracle):** the pattern of computing a context/summary from a persistent store rather than storing it separately.
+- **Summary view (redis agent-memory-server):** a queryable, condensed view over a memory store giving a concise current picture.
+- **Semantic/episodic/procedural memory (Neo4j):** memory-type taxonomy; the facts table is the semantic layer, the profile summary is a semantic projection.
+
+## Implementation Guide
+
+1. **Define the facts table schema.** Each fact is a record with: a stable id, a type/category (e.g., preference, identity, history, domain-state), the fact value (structured or short text), a confidence/verification flag, a timestamp, and a source. Keep facts atomic and individually verifiable so they can be added, updated, or invalidated without rewriting the whole table.
+2. **Define the profile summary as a pure function of the facts table.** Write a deterministic summarizer (template-based, rule-based, or LLM-assisted) that takes the facts table (or a filtered subset) and emits a concise digest. The summary must be reproducible: the same facts table yields the same summary, so it can be regenerated and diffed.
+3. **Choose the regeneration trigger.** Prefer event-driven: whenever a fact is upserted or invalidated, bump a revision counter and mark the cached summary stale; regenerate on next read (lazy) or immediately (eager) depending on latency budget. Alternatively, regenerate on read whenever the facts-table revision differs from the cached summary's revision.
+4. **Keep the summary in the always-injected context layer.** The working context for each turn = profile summary + task-relevant facts + ephemeral state. Do not inject the entire facts table into context; inject the compact summary and page in specific facts only when needed.
+5. **Enforce single source of truth.** Never allow direct editing of the summary as a standalone store. All writes go to the facts table; the summary is only ever a derived artifact. Add a test that asserts the summary equals the summarizer(facts) output for a given revision.
+6. **Handle invalidation and staleness.** When a fact is removed or corrected, the summary must reflect it on the next regeneration. Use the revision counter to detect and force regeneration; never serve a stale summary silently.
+7. **Test the three layers.** Unit-test the summarizer (deterministic output, handles empty facts table, handles a large facts table by truncating to the most salient facts). Test regeneration triggers (fact add/update/remove each produce a new revision and a regenerated summary). Test context injection (summary present, full facts table absent). Test no-drift (editing facts always changes the summary; editing the summary is impossible by construction).
+8. **Respect the suite's constraints.** Keep the facts table local-first (constraint D2) — it is user data and must be storable on-device/intranet. Expose both GUI and MCP access to the facts table and the regenerated summary (constraint D4, MCP-GUI parity). The summary regeneration is a read/derive operation, so it is safe to expose via MCP; the facts table is the writable surface.
+
+## Per-Project Application Notes
+
+- **Familiar:** The facts table holds the user's identity, preferences, and relationship history with the assistant. The profile summary is a compact "who is this user and what do they prefer right now" digest regenerated on every preference change, so the assistant's persona and tone always match the current picture without re-reading the full history. Local-first storage of the facts table is essential (D2); expose fact editing and summary viewing through both GUI and MCP (D4).
+- **Astrographer:** The facts table stores the user's chart data, birth details, and astrological preferences. The profile summary is a concise "current chart picture" (signs, houses, aspects, and the user's stated interests) regenerated when chart data or preferences change, so readings are grounded in the latest facts rather than a stale cached profile. Keep chart facts local-first; expose fact CRUD and summary regeneration via GUI and MCP.
+- **Incanter:** The facts table holds the user's spell/ritual history, intent preferences, and domain-state facts. The profile summary is a compact "current practitioner picture" (recent work, preferred traditions, active intents) regenerated on each new ritual or preference update, keeping the working context concise and current. Local-first storage; GUI + MCP parity for fact and summary access.
+- **Horoscope:** The facts table stores the user's birth data, sign, and daily/weekly content preferences. The profile summary is a concise "current horoscope picture" (sign, key placements, content cadence) regenerated when birth data or preferences change, so daily content is personalized from the latest facts. Local-first; GUI + MCP parity.
+- **Solomon:** The facts table holds the user's domain knowledge, project state, and preferences. The profile summary is a compact "current project picture" (active goals, key facts, preferred working style) regenerated on state changes, giving the assistant a concise current view without re-reading the full knowledge base. Local-first; GUI + MCP parity.
+- **Augur:** The facts table stores the user's prediction/forecast history, domain interests, and confidence preferences. The profile summary is a concise "current forecaster picture" (recent predictions, active domains, calibration preferences) regenerated when predictions or preferences change, keeping forecasts grounded in the latest facts. Local-first; GUI + MCP parity.
+
+## Sources
+
+- https://github.com/neo4j-labs/agent-memory/blob/0dbfaf8a/docs/modules/ROOT/pages/explanation/memory-types.adoc
+- https://blogs.oracle.com/developers/persistent-memory-and-derived-context-a-two-layer-pattern-for-agents
+- https://www.mindstudio.ai/blog/three-layer-ai-memory-architecture
+- https://ar5iv.labs.arxiv.org/html/2512.12818
+- https://doi.org/10.48550/arxiv.2310.08560
+- https://docs.letta.com/guides/core-concepts/memory/memory-blocks/index.md
+- https://github.com/redis/agent-memory-server/blob/main/docs/summary-views.md
+- https://developers.cloudflare.com/agent-memory/concepts/how-agent-memory-works/
+- https://surrealdb.com/docs/agent-memory/operations/profiles
+- https://www.arxiv.org/pdf/2603.29194

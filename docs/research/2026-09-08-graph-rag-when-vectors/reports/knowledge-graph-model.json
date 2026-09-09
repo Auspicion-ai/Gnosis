@@ -1,0 +1,35 @@
+{
+  "slug": "knowledge-graph-model",
+  "title": "Knowledge graph model (noun nodes, relationship edges, properties)",
+  "tier": "MUST",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://neo4j.com/docs/getting-started/appendix/graphdb-concepts/",
+    "https://neo4j.com/docs/getting-started/data-modeling/",
+    "https://deepwiki.com/run-llama/llama_index/10.1-property-graph-index",
+    "https://arxiv.org/abs/2603.22340v1",
+    "https://arxiv.org/html/2605.17072",
+    "https://arxiv.org/pdf/2504.09823v1",
+    "https://arxiv.org/html/2507.03226v2",
+    "https://neo4j.com/blog/developer/unstructured-text-to-knowledge-graph/",
+    "https://neo4j.com/docs/neo4j-graphrag-python/current/user_guide_kg_builder.html",
+    "https://enison.ai/en/blog/knowledge-graph-rag-implementation",
+    "https://docs.lazyllm.ai/en/v0.7.6/Tutorial/19/",
+    "https://prov.readthedocs.io/en/3.1.0/explanation/prov-dm.html",
+    "https://arxiv.org/pdf/2510.02827",
+    "https://arxiv.org/pdf/2502.12442",
+    "https://www.meilisearch.com/blog/knowledge-graph-vs-vector-database-for-rag",
+    "https://tianpan.co/blog/2026-04-17-graphrag-vs-vector-rag-knowledge-graphs"
+  ],
+  "keyFindings": [
+    "The knowledge-graph model (noun nodes, relationship edges, properties on both) is the labeled property graph (LPG) model — the standard data model of graph databases and graph RAG (Neo4j graphdb-concepts; LlamaIndex Property Graph Index).",
+    "Astrographer's Provident graph already IS the knowledge-graph model: `fact`/`reference`/`content` nodes (astrographer.md §4.2.1), `link`/`embed` relationship edges (§4.2.2), and node/edge properties (document metadata §4.1.1; `mode`/`crossWiki` edge flags §4.2.2/§4.2.5) — already in the spec.",
+    "Zodiac's pre-graphing pipeline (zodiac.md §4.2) is the suite's clearest entity/relation extraction: crawled data is parsed into noun nodes (dependency packages), relationship edges (dependencies), and properties (metadata), then queried in graph/hybrid mode (§4.3.2) — already in the spec.",
+    "The concrete MUST work is graph-aware retrieval over the existing model: topological `reference`→`fact` resolution in Astrographer (consistent with the DAG-RAG MUST-HAVE), which enables relationship-aware, multi-hop answers.",
+    "Provenance-as-a-property is the explainability fix: Astrographer's consistency model already tracks every link/embed to its target (astrographer.md §4.2.3) and Zodiac results carry `sourceCrawlId` (zodiac.md §4.3.2) — extending RAG results with a trace path directly answers the governance/sourcing point at low cost.",
+    "Secondary consumers inherit the model indirectly: Incanter's graph is token-level (not noun-entity), Familiar's facts table is flat with provenance properties, and Solomon cross-instance ranking + Mystery topic→reference edges are PARKED until their semantics finalize."
+  ],
+  "recommendation": "MUST",
+  "summary": "The knowledge-graph model (noun-focused nodes, relationship-focused edges, properties on both) is the labeled property graph model that graph RAG runs over. For the Auspicion Suite it is not a foreign technique: Astrographer's Provident graph (fact/reference/content nodes, link/embed edges, node/edge properties) and Zodiac's pre-graphing pipeline already implement it. The concrete MUST/SHOULD work is graph-aware retrieval over the existing model (topological reference→fact resolution) plus a provenance/trace surface on RAG results; expensive global techniques (dynamic graph query generation, cross-instance graph ranking) stay PARKED for D2 cost reasons."
+}

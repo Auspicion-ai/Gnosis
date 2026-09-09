@@ -1,0 +1,38 @@
+{
+  "slug": "graph-rag-suite-consumers",
+  "title": "Other suite consumers (Incanter, Familiar, Solomon, Mystery, Astral)",
+  "tier": "SHOULD",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/pdf/2404.16130",
+    "https://arxiv.org/html/2408.08921v2",
+    "https://arxiv.org/pdf/2504.10499",
+    "https://www.vldb.org/pvldb/vol18/p5623-zhou.pdf",
+    "https://neo4j.com/blog/genai/what-is-graphrag/",
+    "https://www.cognee.ai/what-is-graphrag",
+    "https://microsoft.github.io/graphrag/",
+    "https://github.com/microsoft/graphrag",
+    "https://github.com/microsoft/graphrag/blob/main/docs/query/global_search.md",
+    "https://medium.com/neo4j/graphrag-field-guide-navigating-the-world-of-advanced-rag-patterns-123d847a2837",
+    "https://arxiv.org/html/2508.19855v1",
+    "https://arxiv.org/html/2509.22009",
+    "https://aclanthology.org/2025.acl-long.43.pdf",
+    "https://arxiv.org/pdf/2502.12442",
+    "https://github.com/TheAiSingularity/graphrag-local-ollama/",
+    "https://www.semantic-web-journal.net/system/files/swj4027.pdf",
+    "https://aclanthology.org/2026.tacl-1.29.pdf",
+    "https://github.com/automataia/graphrag-rs",
+    "https://stevereiner.github.io/flexible-graphrag/"
+  ],
+  "keyFindings": [
+    "The suite is already graph-native: Astrographer (reference/fact/embed graph, astrographer.md §4.2), Zodiac (pre-graphing + vector-embedding, zodiac.md §4.2), and Incanter (document graph + graph-tension hybrid, incanter.md §4.4/§4.8) are all graphical RAG engines, so Graph RAG is a completion/exposure task, not a foreign adoption.",
+    "The highest-value MUST work is graph-enhanced retrieval over Astrographer's reference graph (topological resolution of reference→fact, per the DAG-RAG research), which directly enables relationship-aware, multi-hop answers and is D2/D4-compliant.",
+    "Explainability/trace is the strongest governance fit: Astrographer's consistency model (astrographer.md §4.2.3) and Zodiac's sourceCrawlId/stale provenance (zodiac.md §4.3.2) already track provenance; adding a trace path to RAG results is a small, high-value SHOULD.",
+    "Incanter's concrete gaps are engine-boundary handoffs, not new Graph RAG techniques: the BM25 lexical leg (GAP-2, parked D5) and the multi-query fan-out (GAP-1) — both recorded in docs/defects.md.",
+    "Familiar and Astral are consumers/hosts, not Graph RAG engines: Familiar inherits the graph layer through Astrographer's ragQuery (familiar.md §4.3.1/§4.3.3); Astral serves the graphs Astrographer produces (astral.md §4.1), with its relevant enhancement being the agent-facing reachability surface (GAP-5).",
+    "Solomon cross-instance ranking and Mystery crosslink modeling are PARKED: Solomon's Phase-1 keeps cross-peer ordering unpinned (solomon.md §7.4), and Mystery's spec is absent (docs/pending.md #12) — both defer until their contracts finalize."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Graph RAG is not a foreign technique for the Auspicion Suite — Astrographer, Zodiac, and Incanter are already graphical RAG engines over knowledge-graph-shaped data. The MUST work is completing graph-enhanced retrieval over Astrographer's reference graph; the SHOULD work is an explainability/trace surface on RAG results and the Incanter engine-boundary gaps (lexical leg, multi-query fan-out). The expensive global techniques (community summaries, dynamic graph query generation) and the deferred consumers (Solomon ranking, Mystery crosslinks) stay PARKED for D2 cost reasons and spec-absence reasons."
+}

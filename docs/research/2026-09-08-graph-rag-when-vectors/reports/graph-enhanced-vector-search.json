@@ -1,0 +1,41 @@
+{
+  "slug": "graph-enhanced-vector-search",
+  "title": "Graph-enhanced vector search (hybrid graph+vector retrieval)",
+  "tier": "MUST",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://graphrag.com/reference/graphrag/graph-enhanced-vector-search/",
+    "https://graphrag.com/concepts/intro-to-graphrag/",
+    "https://graphrag.com/reference/graphrag/parent-child-retriever/",
+    "https://graphrag.com/reference/graphrag/global-community-summary-retriever/",
+    "https://arxiv.org/pdf/2404.16130",
+    "https://microsoft.github.io/graphrag/",
+    "https://github.com/microsoft/GraphRAG",
+    "https://www.microsoft.com/en-us/research/blog/graphrag-unlocking-llm-discovery-on-narrative-private-data/",
+    "https://learn.microsoft.com/en-us/azure/horizondb/ai/graph-rag",
+    "https://www.cs.purdue.edu/homes/csjgwang/pubs/SIGMOD25_TigerVector.pdf",
+    "https://arxiv.org/html/2501.11216",
+    "https://neo4j.com/developer/genai-ecosystem/hybrid-search/",
+    "https://neo4j.com/blog/developer/graphrag-field-guide-rag-patterns/",
+    "https://doi.org/10.18653/v1/2025.findings-acl.856",
+    "http://arxiv.org/pdf/2405.16506",
+    "https://arxiv.org/abs/2601.11144v3",
+    "https://arxiv.org/html/2603.24925v3",
+    "https://doi.org/10.48550/arxiv.2602.03578",
+    "https://arxiv.org/pdf/2304.01926",
+    "https://www.vldb.org/pvldb/vol18/p4438-sehgal.pdf",
+    "https://github.com/organicdesign/GEVS",
+    "https://www.alphaxiv.org/abs/2507.19715"
+  ],
+  "keyFindings": [
+    "Graph-enhanced vector search is a mature, production-stable family of hybrid retrieval techniques (Microsoft GraphRAG, TigerVector, Neo4j hybrid search, GNN-RAG, GRAG) that fuses a knowledge-graph layer with dense vector retrieval to recover the relationship data and explainability that pure vector search lacks.",
+    "Zodiac's `hybrid` query mode (zodiac.md §4.3.1/§4.3.2) is already the suite's in-spec implementation of graph-enhanced vector search — pre-graphed data + vector-embedded items merged at query time. This is the primary home of the technique and is MUST/already-specified.",
+    "Astrographer's Provident reference graph (astrographer.md §4.2) is already a knowledge graph; graph-enhanced vector search over it (enriching vector results with reference→fact relationship context) directly addresses the source talk's 'vectors don't capture relationship data' and 'similarity != relevance' concerns, and is a natural, low-cost extension of the RAG surface (§4.3).",
+    "The technique is fully D2/D1-compliant: the graph layer is already local (Provident graphs, Zodiac pre-graphing) and the vector layer uses local Ollama embeddings; the expensive sub-techniques (dynamic graph query generation, community summaries) are the D2 cost risk and should stay PARKED.",
+    "D4 parity applies: graph-enhanced retrieval is a retrieval-mode change, not a security-configuration feature, so it must be exposed on both GUI and MCP (rag_query/rag_stream for Astrographer §4.5.1, zodiac_query for Zodiac §4.5).",
+    "Index consistency is the dominant pitfall: when a fact value changes (astrographer.md §4.2.3) or a Zodiac refresh crawl updates the graph (zodiac.md §4.2), the vector embeddings must be re-synced in the same pass, or graph-enhanced retrieval returns stale/contradictory results."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Graph-enhanced vector search (hybrid graph+vector retrieval) fuses a knowledge-graph layer with dense vector retrieval to recover the relationship data and explainability that pure vector search lacks. Zodiac's hybrid query mode (zodiac.md §4.3.2) is already the suite's in-spec implementation (MUST); Astrographer's Provident reference graph (§4.2) makes graph-enhanced vector search a natural, low-cost extension of its RAG surface (§4.3). The technique is D2/D1-compliant and D4-parity-relevant; the expensive sub-techniques (dynamic graph query generation, community summaries) stay PARKED for local-first cost reasons."
+}

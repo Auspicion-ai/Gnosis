@@ -1,0 +1,37 @@
+{
+  "slug": "multi-hop-questions",
+  "title": "Relationship data: filtering, multi-step query data, multi-hop questions",
+  "tier": "MUST",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/pdf/2504.10499",
+    "http://arxiv.org/pdf/2501.00309",
+    "https://arxiv.org/html/2601.00536",
+    "https://www.mdpi.com/2079-9292/12/21/4395",
+    "https://arxiv.org/pdf/2506.00054v1",
+    "https://arxiv.org/pdf/2510.02827",
+    "https://arxiv.org/html/2603.23512",
+    "https://arxiv.org/html/2606.30133v1",
+    "https://theneuralbase.com/graphrag/learn/advanced/multi-hop-reasoning-with-graphs/",
+    "https://enison.ai/en/blog/knowledge-graph-rag-implementation",
+    "https://arxiv.org/html/2503.13804v1",
+    "https://surrealdb.com/blog/knowledge-graph-rag-two-query-patterns-for-smarter-ai-agents",
+    "https://aclanthology.org/2025.findings-emnlp.329.pdf",
+    "https://graphrag.com/reference/graphrag/parent-child-retriever/",
+    "https://graphrag.com/reference/graphrag/global-community-summary-retriever/",
+    "https://arxiv.org/pdf/2404.16130",
+    "https://arxiv.org/html/2509.22009",
+    "https://arxiv.org/html/2501.11216"
+  ],
+  "keyFindings": [
+    "Relationship data is the suite's native RAG value proposition, not an add-on: Astrographer's reference graph (reference→fact, §4.2.1/§4.2.3) and Zodiac's pre-graphed dependency data (§4.2) are already pinned relationship structures that pure vector retrieval cannot express.",
+    "Astrographer's ragQuery already has an undefined `filters?` parameter (§4.3.2) — the low-risk, additive home for relationship-aware filtering (by node kind, relationship/edge type, reference target, wiki), directly implementing the source talk's 'person with comment access' filtering example.",
+    "Multi-hop over Astrographer's reference graph is the MUST-HAVE topological resolution already recommended in dag-rag-research-notes.md §4: resolving a reference requires resolving its target fact first, a dependency-ordered traversal that must respect the §4.2.3 consistency invariant (FRESH/RESOLVED vs BROKEN/STALE).",
+    "Zodiac's graph mode (§4.3.2) already returns pre-graphed subgraphs; transitive dependency-closure traversal (multi-hop) and relationship-type filtering (depends_on vs dev_depends_on) are proposed SHOULD extensions to §4.3.1/§4.3.2 and the zodiac_query MCP tool.",
+    "Incanter's graph is a token-transition multigraph (§4.4), not a semantic relationship graph — relationship data belongs at the Astrographer/Zodiac layer, not inside Incanter's token graph.",
+    "D4 parity requires relationship filtering + multi-hop on both GUI and MCP (rag_query/rag_stream, zodiac_query); cross-instance multi-hop via Solomon is NICE-TO-HAVE/PARKED, and Mystery's topic→reference relationship model is PARKED until its spec exists."
+  ],
+  "recommendation": "MUST",
+  "summary": "Relationship data — filtering by relationship/edge type, multi-step query data, and multi-hop question answering — is the suite's native Graph RAG value proposition, and the relationship substrate (Astrographer's reference graph, Zodiac's pre-graphed dependency data) is already pinned in the contracts. The MUST items are low-risk, additive spec changes: define relationship-aware filtering on Astrographer's ragQuery `filters` param (§4.3.2), add topological reference→fact multi-hop resolution (§4.2.3), and expose both through GUI + MCP (D4). Zodiac's graph mode gains transitive multi-hop and relationship-type filtering as SHOULD items; cross-instance multi-hop (Solomon) and Mystery's topic→reference model are PARKED until the local foundation lands."
+}

@@ -1,0 +1,36 @@
+{
+  "slug": "graph-enrichments",
+  "title": "Graph enrichments",
+  "tier": "SHOULD",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://typegraph.ai/blog/entity-resolution-rag-knowledge-graph",
+    "https://opendatascience.com/entity-resolved-knowledge-graphs-the-foundation-for-effective-graphrag/",
+    "https://theneuralbase.com/graphrag/learn/intermediate/entity-resolution-for-new-content/",
+    "https://arxiv.org/html/2502.06472",
+    "https://www.springerprofessional.de/large-language-model-based-automatic-knowledge-graph-enrichment/52617996",
+    "https://arxiv.org/abs/2603.22340v1",
+    "https://arxiv.org/pdf/2404.16130",
+    "https://www.microsoft.com/en-us/research/publication/from-local-to-global-a-graph-rag-approach-to-query-focused-summarization/",
+    "https://microsoft.github.io/graphrag/",
+    "https://github.com/microsoft/graphrag",
+    "https://www.alphaxiv.org/abs/2510.14271",
+    "https://graphrag.com/reference/graphrag/graph-enhanced-vector-search/",
+    "https://arxiv.org/html/2603.24925v3",
+    "https://arxiv.org/pdf/2504.09823v1",
+    "https://aclanthology.org/2025.findings-emnlp.290.pdf",
+    "https://arxiv.org/pdf/2504.11544",
+    "https://enison.ai/en/blog/knowledge-graph-rag-implementation"
+  ],
+  "keyFindings": [
+    "Graph enrichments (entity resolution, relationship/property enrichment, denoising) supply the relationship context that vector similarity cannot, directly addressing the source talk's 'vectors don't capture relationship data' and 'similarity != relevance' theses.",
+    "Astrographer's fact/reference/embed graph (astrographer.md §4.2) is already a property-rich graph; the highest-value enrichment is entity resolution over `fact` nodes so the single-source-of-truth invariant (§4.2.3) is not fragmented across duplicate keys.",
+    "Zodiac's pre-graphing pipeline (zodiac.md §4.2) is the suite's graph-construction surface and the natural home for enrichment: entity resolution across crawled sources plus derived relationship/property edges make `graph`-mode queries (§4.3.2) complete.",
+    "Enrichment is LLM-heavy and ingestion-time, so D2 local-first is the deciding constraint: entity resolution and relationship enrichment can run on the suite's existing local LLMs, but the GraphRAG-style community-summarization pass is the heaviest and least D2-friendly and should be parked.",
+    "Enrichment is a clean D3 interconnection capability: Zodiac enriches its pre-graphs, Astrographer consumes them (edge #1) and enriches its fact graph, and Familiar/Solomon consume enriched graphs; it is not a D4 carve-out, so every enrichment feature must be exposed on both GUI and MCP.",
+    "Incanter's token-transition multigraph (incanter.md §4.4) is a co-occurrence structure, not a semantic entity graph, so semantic enrichment belongs in Astrographer/Zodiac, not Incanter (DISCARD for Incanter)."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Graph enrichments improve graph-aware RAG by resolving duplicate entities, adding relationship/property edges, and denoising the graph — supplying the relationship context vector similarity lacks. For the Auspicion Suite the highest-value, lowest-cost increments are entity resolution over Astrographer's `fact` nodes (astrographer.md §4.2.1) and entity resolution + relationship/property enrichment in Zodiac's pre-graphing pipeline (zodiac.md §4.2), both runnable on local LLMs (D2). The heavy GraphRAG-style community-summarization pass is parked, and semantic enrichment of Incanter's token graph is discarded."
+}

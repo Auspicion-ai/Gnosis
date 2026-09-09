@@ -1,0 +1,35 @@
+{
+  "slug": "community-summaries",
+  "title": "Community summaries (GraphRAG-style aggregation)",
+  "tier": "SHOULD",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/pdf/2404.16130",
+    "https://github.com/microsoft/graphrag/blob/main/docs/query/global_search.md",
+    "https://microsoft-graphrag.mintlify.app/concepts/community-detection",
+    "https://mintlify.wiki/microsoft/graphrag/concepts/retrieval-methods",
+    "https://www.microsoft.com/en-us/research/blog/graphrag-improving-global-search-via-dynamic-community-selection/",
+    "https://aclanthology.org/2025.findings-emnlp.568.pdf",
+    "https://github.com/HKUDS/LightRAG/",
+    "https://collabnix.com/neo4j/2025/05/20/under-the-covers-with-lightrag-extraction-and-retrieval/",
+    "https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/graphrag-costs-explained-what-you-need-to-know/4207978",
+    "https://www.bestaiweb.ai/indexing-cost-token-blowup-and-the-hard-engineering-limits-of-graphrag-at-scale/",
+    "https://bestin-it.com/graphrag-benchmark-sec-filings/",
+    "https://arxiv.org/abs/2502.11371v3",
+    "https://theneuralbase.com/graphrag/learn/intermediate/when-to-use-each-retrieval-path/",
+    "https://github.com/theaisingularity/graphrag-local-ollama",
+    "https://joeywang.github.io/posts/rag-hub/",
+    "https://developers.llamaindex.ai/python/examples/cookbooks/graphrag_v1/"
+  ],
+  "keyFindings": [
+    "Community summaries (Microsoft GraphRAG global search) answer global/theme-level questions that vector-only retrieval cannot, but are the most expensive part of GraphRAG: an LLM summary pass over every community at every hierarchy level, paid at index time.",
+    "LightRAG deliberately skips the community-summarization pass and reports matching/beating GraphRAG on retrieval accuracy at roughly 1-2 orders of magnitude lower token cost (up to ~100x), demonstrating the pass is optional, not core.",
+    "The suite's primary graph is a sparse reference graph (fact/reference/link/embed, astrographer.md §4.2), not a dense entity graph, so full Leiden hierarchical community detection is mis-shaped for Astrographer; Zodiac's pre-graphed dependency graph is the one dense-entity fit.",
+    "Astrographer has no community-summary contract element: getConsistencyReport (§4.2.3) is per-reference, not a summary, and ragQuery/ragStream (§4.3.2) return flat top-K results with no global/theme mode.",
+    "A scoped, lazy, local community-summary surface (Astrographer wiki-level/document-cluster, Zodiac per-target, Astral published-wiki) is D2-compatible and answers the source talk's global-question gap without the index-time cost cliff.",
+    "The full Microsoft GraphRAG hierarchical community-summarization pipeline stays PARKED for D2 cost/latency reasons; the scoped wiki-level/per-target summary is the SHOULD expression."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Community summaries (GraphRAG global search) enable theme-level questions but are the most expensive part of GraphRAG; LightRAG's evidence shows the full hierarchical summarization pass is optional. For the suite, a scoped, lazy, local community-summary surface (Astrographer wiki-level/document-cluster, Zodiac per-target, Astral published-wiki) is a SHOULD that closes the global-question gap at acceptable D2 cost and is exposable on both GUI and MCP (D4); the full hierarchical pipeline stays PARKED."
+}

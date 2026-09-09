@@ -1,0 +1,17 @@
+# build artifacts
+/target/
+
+# environment
+.env
+.env.*
+*.env
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# local caches
+.cache/

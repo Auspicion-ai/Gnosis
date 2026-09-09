@@ -1,0 +1,36 @@
+{
+  "slug": "dynamic-graph-query-generation",
+  "title": "Dynamic graph query generation (LLM-generated graph queries)",
+  "tier": "SHOULD",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/html/2412.10064",
+    "https://aclanthology.org/2025.genaik-1.11.pdf",
+    "https://neo4j.com/docs/neo4j-graphrag-python/current/user_guide_rag.html",
+    "https://neo4j.com/docs/neo4j-graphrag-python/current/_modules/neo4j_graphrag/retrievers/text2cypher.html",
+    "https://neo4j.com/blog/developer/effortless-rag-text2cypherretriever/",
+    "https://graphrag.com/reference/graphrag/text2cypher/",
+    "https://neo4j.com/blog/genai/what-is-graphrag/",
+    "https://reference.langchain.com/python/langchain-neo4j/chains/graph_qa/cypher/GraphCypherQAChain",
+    "https://docs.langchain.com/oss/python/integrations/graphs/neo4j_cypher",
+    "https://developers.llamaindex.ai/python/examples/query_engine/knowledge_graph_query_engine/",
+    "https://developers.llamaindex.ai/python/framework/module_guides/indexing/lpg_index_guide/",
+    "https://arxiv.org/html/2512.14277",
+    "https://github.com/IBM/agentic-text2sparql",
+    "https://arxiv.org/pdf/2511.08274",
+    "https://arxiv.org/html/2605.22937v1",
+    "https://github.com/FalkorDB/GraphRAG-SDK/blob/main/graphrag_sdk/src/graphrag_sdk/retrieval/strategies/cypher_generation.py",
+    "https://arxiv.org/pdf/2404.16130"
+  ],
+  "keyFindings": [
+    "Dynamic graph query generation is the Graph RAG path where an LLM translates a natural-language question into a structured graph query (Cypher/SPARQL) at query time and executes it against a knowledge graph — the generated query doubles as the explainability trace, directly answering the source talk's 'vectors don't capture relationship data' and 'vector similarity != relevance' failures.",
+    "Astrographer's data model is already a knowledge graph (fact/reference/embed nodes and edges, astrographer.md §4.2), so an LLM-generated graph query over the reference→fact graph is a natural, graph-native fit for relationship-aware and multi-hop retrieval; it is NOT in the spec (§4.3.2 pins a string query) and is a proposed spec change.",
+    "The technique is gated on a graph-query substrate (a Cypher/SPARQL executor) over Provident graphs, which the suite does not yet have — the dominant cost/benefit consideration and the reason it is SHOULD, not MUST.",
+    "Zodiac's graph mode (zodiac.md §4.3.2) already returns a pre-graphed subgraph; a generated graph query adds precision (retrieve only the relevant subgraph) rather than capability, so it is lower priority than Astrographer's.",
+    "The engine boundary (Incanter) is the correct home for query-time graph retrieval, mirroring GAP-1 (multi-query belongs inside Incanter, docs/defects.md) — a handoff candidate, not a this-repo change.",
+    "D2 (local LLM + local graph) and D4 (a retrieval-mode change, not a security carve-out) are both satisfied; the technique should land after the MUST/SHOULD retrieval foundation (reranking, multi-query, hybrid, compression) ships, consistent with the sibling graph-rag-astrographer report's PARKED-until-foundation note."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Dynamic graph query generation is a high-value, graph-native retrieval technique in which an LLM writes a structured graph query (Cypher/SPARQL) per question and executes it against a knowledge graph, directly expressing relationship-aware and multi-hop retrieval and doubling as an explainability trace. It is a strong fit for Astrographer (whose data model is already a knowledge graph) and a lower-priority fit for Zodiac, but it is gated on a graph-query substrate the suite does not yet have, so it is a SHOULD that lands after the MUST/SHOULD retrieval foundation ships."
+}

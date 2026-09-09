@@ -1,0 +1,35 @@
+{
+  "slug": "parent-child-retrievers",
+  "title": "Parent-child retrievers (hierarchical chunking/retrieval)",
+  "tier": "SHOULD",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://github.com/langchain-ai/langchain/blob/85a5a04210452aec2eb3a06a02961c8fefd5c8b6/libs/langchain/langchain_classic/retrievers/parent_document_retriever.py",
+    "https://zeroentropy.dev/concepts/parent-document-retrieval/",
+    "https://thread-transfer.com/blog/2025-07-29-parent-document-retrieval/",
+    "https://docs.haystack.deepset.ai/docs/automergingretriever",
+    "https://developers.llamaindex.ai/python/framework/integrations/retrievers/auto_merging_retriever/",
+    "https://github.com/run-llama/llama_index/blob/main/llama-index-packs/llama-index-packs-recursive-retriever/README.md",
+    "https://developers.llamaindex.ai/python/framework-api-reference/packs/sentence_window_retriever/",
+    "https://learnixo.io/blog/adv-rag-small-to-big",
+    "https://theneuralbase.com/advanced-rag/learn/beginner/recursive-retrieval/",
+    "https://aclanthology.org/2025.icnlsp-1.15.pdf",
+    "https://proceedings.iclr.cc/paper_files/paper/2024/file/8a2acd174940dbca361a6398a4f9df91-Paper-Conference.pdf",
+    "https://ai-tldr.dev/learn/rag/advanced-rag/parent-document-retrieval/",
+    "https://dreaming.press/posts/parent-document-vs-sentence-window-retrieval.html",
+    "https://vivedhaelango.substack.com/p/lesson-84-parent-child-retrieval",
+    "https://barkingiguana.com/writing/parent-document-retrieval-small-chunks-big-context/",
+    "https://www.trulens.org/cookbook/frameworks/llamaindex/llama_index_sentencewindow/"
+  ],
+  "keyFindings": [
+    "Parent-child retrieval decouples the indexing unit (small child chunks for precise, high-recall retrieval) from the context unit (the larger parent chunk/document returned to the generator). It is a mature, open pattern (LangChain ParentDocumentRetriever, LlamaIndex auto-merging/sentence-window/recursive, Haystack AutoMergingRetriever) with four variants differing in how 'parent' is defined.",
+    "Astrographer's contract already has the natural parent/child split: a Document (astrographer.md §4.1.1) is the parent and its content/fact/reference nodes (§4.2.1) are the children; Incanter's spring-tension dynamic chunking (incanter.md §4.6) is the child-generation mechanism. A parent-child mode on ragQuery/ragStream (§4.3.2) would expand a retrieved child to its parent Document/subgraph before generation.",
+    "The fact/reference model makes a narrow MUST-adjacent case: retrieving a reference/embed child should expand to the canonical fact and its owning document (astrographer.md §4.2.3), honoring the STALE marker — the same reasoning that made exact factKey retrieval a narrow MUST in hybrid-search-research-notes.md.",
+    "Zodiac's pre-graphing + vector-embedding pipeline (zodiac.md §4.2) has the same two-level structure; a parent expansion on zodiac_query (§4.3.2) would return the parent graph/document for a matched embedded item, carrying the stale flag (§6.11).",
+    "The technique is fully D2-compliant (local ingestion-time index + query-time expansion, reusing the local Ollama embedding leg), D1-compliant (open pattern, no licensing constraint), and D4-compliant if exposed as a query parameter on both GUI and MCP (rag_query/rag_stream, zodiac_query).",
+    "The cleanest home for the engine-side parent expansion is inside Incanter's POST /v1/query (incanter.md §4.8) so Astrographer's ragQuery stays a single call — an Incanter handoff (docs/defects.md GAP-1 pattern), not a patch from this repo."
+  ],
+  "recommendation": "SHOULD",
+  "summary": "Parent-child retrieval (hierarchical chunking/small-to-big) indexes small child chunks for precise retrieval but returns the larger parent chunk/document as context, fixing the small-chunk-vs-big-context trade-off. It maps cleanly onto Astrographer's Document/node model and Zodiac's pre-graphing pipeline, is fully local-first (D2) and open (D1), and must be exposed on both GUI and MCP for D4 parity. Recommended SHOULD, with a narrow MUST-adjacent slice for Astrographer's fact/reference resolution to the canonical source of truth."
+}

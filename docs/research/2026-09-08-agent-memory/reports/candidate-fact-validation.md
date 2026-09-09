@@ -1,0 +1,70 @@
+# Candidate Fact Validation
+
+**Topic:** Deterministic validation prevents hallucinated or malformed facts from entering the facts table
+
+## Summary
+
+This topic covers the deterministic validation stage that sits between candidate-fact extraction and the durable facts table in an LLM-driven knowledge pipeline. The core claim: because LLM extraction is probabilistic and prone to hallucination, malformed structure, and semantic drift, a deterministic (non-LLM, rule/schema/constraint-based) validation gate must reject bad candidates before they are committed. The validation layer is the "last line of defense" that guarantees the facts table only ever contains well-formed, referentially-consistent, deduplicated facts. The report synthesizes the state of the art across three complementary layers: (1) structural/schema validation (JSON Schema, Pydantic, typed output contracts) that rejects malformed records; (2) semantic/grounding validation (provenance tracking, retrieval-augmented verification, knowledge-graph anchoring, fact-checking) that rejects hallucinated or unverifiable content; and (3) deterministic post-processing (constraint enforcement, entity resolution/deduplication, referential integrity, cross-field consistency) that enforces invariants an LLM cannot be trusted to hold. The key architectural principle is separation of concerns: the LLM proposes, the deterministic layer disposes. Validation must be exhaustive, fail-closed, and produce machine-actionable rejection reasons so rejected candidates can be re-proposed or surfaced to a human. The report maps these techniques onto the six Auspicion Suite projects (Familiar, Astrographer, Incanter, Horoscope, Solomon, Augur), each of which maintains a facts table and therefore needs the deterministic validation gate.
+
+## State of the Art
+
+The current state of the art treats LLM fact extraction as a two-phase pipeline: a generative proposal phase and a deterministic validation phase. The generative phase is explicitly distrusted; the validation phase is where reliability is bought. Three techniques dominate.
+
+1) STRUCTURAL VALIDATION (schema/type contracts). The dominant practice is to constrain the LLM's output to a typed schema and then validate the parsed result deterministically. Pydantic-based structured output is the mainstream approach: the model emits JSON conforming to a declared model, and Pydantic validates types, required fields, and value constraints at parse time, rejecting malformed records before they reach storage (Rubel 2025). JSON Schema serves the same role in schema-first pipelines. The key insight from the AO Labs analysis is that "structured LLM extraction is a validation problem": the hard part is not getting the model to emit JSON but validating that the emitted JSON is correct, complete, and consistent. A critical refinement is that JSON Schema alone is insufficient for production outputs — a "semantic validation layer" is needed on top of syntactic schema validation, because schema checks types and shapes but cannot verify that values are semantically plausible, referentially valid, or consistent with domain constraints (Tian Pan 2026).
+
+2) SEMANTIC/GROUNDING VALIDATION (hallucination defense). Because structural validity does not imply factual correctness, the state of the art adds grounding checks. Provenance tracking attaches each candidate fact to the source span it was extracted from, so a fact with no supporting source can be rejected (Computers 2025 anchor-constrained framework). Retrieval-augmented verification re-checks candidate facts against a trusted corpus before acceptance (arXiv 2504.06438 premise verification). Knowledge-graph-based retrofitting and hybrid fact-checking pipelines combine KG lookups, LLM reasoning, and search-based retrieval agents to verify claims interpretably (AAAI 29770; ACL 2025.winlp-main.19). Ontology-guided extraction (ODKE+) constrains candidates to ontology-valid types and relations, so a candidate that violates the ontology is rejected at the source.
+
+3) DETERMINISTIC POST-PROCESSING (invariant enforcement). The final layer is pure, deterministic code that enforces invariants an LLM cannot be trusted to hold: entity resolution and deduplication (two candidates referring to the same entity must collapse to one row), referential integrity (a fact referencing a non-existent entity is rejected), cross-field consistency (a birth date must precede a death date), and constraint satisfaction (cardinality, uniqueness, required-value rules). The deterministic-pipeline architecture literature (DOI 10.36871/2618-9976.2026.05.003) explicitly frames extraction as a deterministic pipeline with LLM stages, where validation is a hard gate. The unifying principle across all sources: the LLM proposes, the deterministic layer disposes. Validation is fail-closed — a candidate that cannot be validated is rejected, not silently accepted — and produces machine-actionable rejection reasons so the pipeline can re-propose or escalate to a human reviewer.
+
+## Key Concepts Glossary
+
+- Candidate fact: a fact proposed by the LLM extraction step, not yet committed to the facts table. It carries the extracted subject/predicate/object (or attribute/value) plus provenance metadata.
+- Deterministic validation: a non-LLM, rule/schema/constraint-based gate that accepts or rejects candidate facts. Deterministic means the same input always yields the same verdict — no model sampling variance.
+- Structural (schema) validation: checking that a candidate conforms to a declared type contract — required fields present, correct types, value shapes, enum membership. Implemented via JSON Schema, Pydantic models, or typed output contracts.
+- Semantic validation: checking that a candidate is factually plausible and grounded — that it has a supporting source, is consistent with a trusted corpus, or conforms to an ontology. This is the hallucination defense.
+- Provenance tracking: attaching each candidate to the source span/document it was extracted from, enabling rejection of ungrounded facts.
+- Grounding / retrieval-augmented verification: re-checking a candidate against a trusted reference (corpus, knowledge graph, search results) before acceptance.
+- Entity resolution / deduplication: deterministically collapsing multiple candidate references to the same real-world entity into one canonical row.
+- Referential integrity: the rule that a fact may only reference entities/relations that already exist in the facts table or ontology; dangling references are rejected.
+- Cross-field consistency: deterministic checks that related fields are mutually consistent (e.g., date ordering, unit agreement, cardinality).
+- Fail-closed: the validation policy that an unverifiable candidate is rejected rather than admitted; the safe default for a facts table.
+- Rejection reason: a machine-actionable code/message produced by the validator so the pipeline can re-propose, escalate, or log the rejection.
+- Facts table: the durable, validated store of facts that downstream consumers (queries, reasoning, UI) trust.
+
+## Implementation Guide
+
+Implement the deterministic validation gate as a distinct, testable stage between candidate-fact extraction and the facts table. Follow this layered design.
+
+LAYER 1 — STRUCTURAL VALIDATION (reject malformed). Define a typed contract for every fact record (subject, predicate, object/attribute, value, confidence, provenance, source_id, extracted_at). Validate with a schema engine (JSON Schema or Pydantic) that enforces: required fields present; correct types; enum membership for predicates/relations; value shape (dates, numbers, units); max lengths. Reject any record that fails. This catches malformed output before any semantic reasoning.
+
+LAYER 2 — SEMANTIC/GROUNDING VALIDATION (reject hallucinated). For each structurally-valid candidate: (a) require non-empty provenance pointing to a real source span; reject candidates with no supporting source. (b) Optionally re-verify against a trusted corpus or knowledge graph via retrieval-augmented checks. (c) Enforce ontology conformance — the predicate and object types must be valid for the subject type. A candidate that fails grounding is rejected or downgraded to a "needs-review" queue, never silently admitted.
+
+LAYER 3 — DETERMINISTIC POST-PROCESSING (enforce invariants). Run pure, deterministic code that enforces: entity resolution/deduplication (canonicalize entity references, collapse duplicates); referential integrity (reject facts referencing non-existent entities); cross-field consistency (date ordering, unit agreement, cardinality, uniqueness); and any domain-specific business rules. This layer is fully unit-testable and must be exhaustive.
+
+CROSS-CUTTING REQUIREMENTS. (1) Fail-closed default: unverifiable candidates are rejected, not admitted. (2) Machine-actionable rejection reasons: each rejection carries a code + message so the pipeline can re-propose, escalate to a human, or log. (3) Idempotency: re-running validation on the same candidate yields the same verdict. (4) Testability: every rule is a pure function with unit tests; the whole gate is exercised by red→green TDD. (5) Separation of concerns: the LLM proposes, the deterministic layer disposes — never let the LLM be the sole judge of its own output. (6) Auditability: log every accepted and rejected candidate with its reason, so the facts table's integrity is provable.
+
+## Per-Project Application Notes
+
+Familiar: The facts table holds entity/relationship facts about people, places, and things the user cares about. Deterministic validation must enforce referential integrity (a fact may only reference entities already in the table), entity resolution/deduplication (the same person referenced under different names collapses to one row), and cross-field consistency (e.g., a birth date must precede a death date). Provenance tracking is essential so every fact is traceable to a source the user can verify.
+
+Astrographer: The facts table stores astronomical/observational facts (celestial objects, coordinates, magnitudes, discovery dates). Validation must enforce numeric/unit correctness (coordinates in valid ranges, magnitudes within physical bounds), referential integrity (a fact about a star must reference a real catalog object), and cross-field consistency (e.g., right ascension/declination ranges). Ontology conformance is critical: predicates must be valid for the object type (a star cannot have a planet's orbital period).
+
+Incanter: The facts table holds magical/ritual/incantation facts and their effects. Validation must enforce schema conformance (required fields for a spell/ritual record), enum membership for effect types and components, and cross-field consistency (e.g., required components must be present for a given ritual type). Semantic grounding matters less than structural integrity here, but provenance (source grimoire/reference) should still be required to reject fabricated incantations.
+
+Horoscope: The facts table stores astrological facts (signs, houses, planetary positions, aspect interpretations). Validation must enforce enum membership (valid signs, houses, aspects), numeric ranges (planetary degrees 0–360), and cross-field consistency (a planet's position must be within its sign's degree range). Deduplication prevents the same astrological claim from being stored multiple times under different phrasings.
+
+Solomon: The facts table holds judgment/decision facts and their supporting reasoning. Validation must enforce referential integrity (a decision must reference real entities and prior facts), provenance (every judgment must cite the evidence it rests on), and cross-field consistency (a decision's conclusion must be consistent with its stated premises). This is the highest-stakes table: hallucinated or malformed facts here directly corrupt downstream decisions, so the fail-closed default and rejection-reason logging are mandatory.
+
+Augur: The facts table stores predictive/omen facts and their observed outcomes. Validation must enforce schema conformance (required fields for a prediction record), provenance (every omen must be traceable to an observed event), and cross-field consistency (a prediction's outcome must be recorded against the prediction it validates). Deduplication prevents the same omen from being logged repeatedly. Because predictions are inherently uncertain, the gate should distinguish "structurally valid but unverified" (parked for later outcome matching) from "malformed/hallucinated" (rejected outright).
+
+## Sources
+
+- https://aolabs.dev/blog/structured-llm-extraction-validation/
+- https://rubel.dev/blog/structured-output-with-pydantic-a-guide-to-reliable-llm-parsing
+- https://tianpan.co/blog/2026-04-15-semantic-validation-llm-outputs
+- https://doi.org/10.3390/computers15030178
+- https://arxiv.org/html/2504.06438
+- https://ojs.aaai.org/index.php/AAAI/article/download/29770/31326
+- https://aclanthology.org/2025.winlp-main.19.pdf
+- https://www.arxiv.org/pdf/2509.04696
+- https://doi.org/10.36871/2618-9976.2026.05.003

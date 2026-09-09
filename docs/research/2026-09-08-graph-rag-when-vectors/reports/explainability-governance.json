@@ -1,0 +1,35 @@
+{
+  "slug": "explainability-governance",
+  "title": "Explainability and governance (sourcing and tracing)",
+  "tier": "MUST",
+  "date": "2026-09-08",
+  "webEnabled": true,
+  "sources": [
+    "https://arxiv.org/pdf/2409.11242",
+    "https://aclanthology.org/2024.emnlp-main.347.pdf",
+    "https://aiarch.dev/patterns/grounded-rag",
+    "https://gautierdorval.com/en/definitions/retrieval-provenance/",
+    "https://www.ijfmr.com/papers/2026/3/80826.pdf",
+    "https://doi.org/10.1109/acdsa67686.2026.11468256",
+    "https://doi.org/10.48550/arxiv.2604.24623",
+    "https://docs.trustgraph.ai/overview/explainability.html",
+    "https://github.com/trustgraph-ai/trustgraph/blob/4e3bd85a/docs/tech-specs/query-time-explainability.md",
+    "https://thomasthelliez.com/blog/rag-governance-source-authority-access-control-auditability/",
+    "https://gautierdorval.com/en/frameworks/rag-governance-retrieval-and-inference-control/",
+    "https://scadea.com/enterprise-rag-and-permission-aware-retrieval/",
+    "https://docushell.com/blog/how-do-you-build-an-auditable-rag-pipeline-for-enterprise-documents",
+    "https://arxiv.org/html/2607.02116v2",
+    "https://aclanthology.org/2024.eacl-demo.16.pdf",
+    "https://link.springer.com/article/10.1007/s10994-026-07121-y"
+  ],
+  "keyFindings": [
+    "The suite already implements the talk's 'sourcing and tracing' across its contracts: Astrographer's consistency report + exact-reference resolution (astrographer.md §4.2.3), Zodiac's sourceCrawlId + stale flag (zodiac.md §4.3.2), Familiar's facts provenance + fail-closed validation (familiar.md §4.1.3), Solomon's peerId/instanceType (solomon.md §4.2.2), and Astral's source tool + contentHash (astral.md §4.1) — all already in the specs.",
+    "The concrete MUST work is making provenance answer-level: extend Astrographer's ragQuery/ragStream result (astrographer.md §4.3.2) and Zodiac's query result (zodiac.md §4.3.2) with a citations field (the source set the answer is grounded on) and a trace field (the graph path walked) — cheap because the provenance substrate already exists.",
+    "A RAG query audit log (who asked what, when, what was returned) is the auditability axis of governance and is a SHOULD addition to astrographer.md §4.3, consistent with D4 (exposable via both GUI and MCP).",
+    "Familiar already implements the strongest provenance + audit model in the suite: facts carry provenance {conversation_id, message_id}, the candidate-fact pipeline is fail-closed with machine-actionable rejection reasons, and every accepted/rejected candidate is logged (familiar.md §4.1.3.1).",
+    "Explainability is only meaningful if measurable: adopting RAGAS-style faithfulness/answer-relevance metrics (aclanthology.org/2024.eacl-demo.16.pdf) as an evaluation gate is a SHOULD, making the talk's governance point verifiable rather than asserted.",
+    "Secondary consumers need little new work: Incanter's per-item provenance (doc_id/chunk_id, incanter.md §4.8) is already in spec; Solomon deep provenance (sourceRef) and Mystery's provenance-carrying crosslink edges are PARKED until their search/crosslink semantics finalize."
+  ],
+  "recommendation": "MUST",
+  "summary": "Explainability and governance (sourcing and tracing) is not a foreign addition for the Auspicion Suite — the provenance substrate is already in the specs (Astrographer's consistency report and exact-reference resolution, Zodiac's sourceCrawlId, Familiar's facts provenance, Solomon's peerId/instanceType, Astral's contentHash). The concrete MUST/SHOULD work is making provenance answer-level (citation + trace path on RAG results) and auditable (a RAG query audit log), both cheap because the substrate exists, plus RAGAS-style faithfulness/answer-relevance evaluation. This directly answers the source talk's governance point and is consistent with D1 (open-source, auditable), D2 (all local), D3 (provenance flows across the interconnected tools), and D4 (exposable via GUI + MCP)."
+}

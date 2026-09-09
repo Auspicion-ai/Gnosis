@@ -1,0 +1,89 @@
+# 3-layer memory: vector search
+
+**runId:** `memory-vector-search`
+**topicId:** `memory-vector-search`
+**topicTitle:** 3-layer memory: vector search embeds each turn, runs cosine distance, injects only chunks above the similarity threshold
+
+## Summary
+
+This topic is the third and heaviest layer of the "3-layer memory" agent-memory pattern (profile summary / facts table / vector search). The vector-search layer works as follows: on every turn, the agent embeds what was said (the user message, and per the source notes the user↔assistant exchange), runs cosine distance against a corpus of previously embedded chunks, and injects into the prompt only those chunks whose similarity to the query exceeds a configurable threshold. The two dependencies pin the two retrieval-quality decisions that make this layer work: (1) vectorization-chunking — the corpus must be chunked per exchange (or per fact node) rather than embedded as one long "blurry" vector, because a single long vector averages over many distinct facts and loses precise relations; and (2) vectorization-long-vector — the contrast this layer improves upon, i.e. the failure mode of embedding a whole conversation/transcript as one long vector. In the Auspicion Suite this layer is the PARKED/speculative increment of Familiar's memory store (docs/specs/familiar.md §4.1.3, docs/pending.md D6, docs/research/agent-memory-research-notes.md §3.1/§3.2). It must be a local embedding store inside Familiar (D2), NOT delegated to Astrographer/Incanter, preserving the memory-store ≠ document-store distinction (MUST-2). The threshold is the key tunable: too low injects irrelevant chunks (noise, context bloat), too high injects nothing (recall loss). The threshold is notoriously non-portable across embedding models and corpora — a threshold tuned on one model does not transfer to another (a documented failure mode in the literature). The layer is parked until the facts-table + profile-summary core ships; when pursued it must be GUI + MCP (D4) and feed Solomon cross-instance search (F7).
+
+## State of the art
+
+The 3-layer memory pattern (profile summary / facts table / vector search) is a well-established agent-memory architecture popularized by Mem0-style memory systems and layered-memory research. The vector-search layer specifically is the semantic-recall component: it maintains an embedding index over conversation-derived chunks and, at query time, embeds the current turn and retrieves the nearest chunks. State of the art in 2024–2026:
+
+1. **Per-exchange / per-unit chunking is the retrieval-quality fix.** The core insight (from the source notes and corroborated by RAG practice) is that embedding a long vector — a whole conversation or a long transcript — produces a "blurry image": the vector averages over many distinct facts and loses precise relations, and the agent is slow to parse a passed response transcript. Chunking per exchange (a user message + its assistant reply) or per fact node yields many more precise vectors. This is the same principle as graph-structure chunking per fact node in graph RAG (HybridRAG, LightRAG). The dependency vectorization-chunking pins this; vectorization-long-vector pins the failure mode it improves upon.
+
+2. **Cosine similarity + threshold gating.** Retrieval is done by embedding the query and computing cosine similarity against stored chunk embeddings, then keeping only chunks above a similarity threshold. The threshold is the primary precision/recall control. Two retrieval modes are common: (a) top-k (always return the k nearest), and (b) threshold-gated (return only those above a cutoff). The topic's design is explicitly threshold-gated ("injects only chunks above the similarity threshold"), which trades guaranteed context for precision — it can return zero chunks when nothing is similar enough.
+
+3. **The threshold does not transfer across models/corpora.** A documented failure mode (e.g. the "gap threshold that didn't transfer" writeup) is that a similarity threshold tuned on one embedding model or corpus does not transfer to another. Cosine similarity distributions differ by model, normalization, and domain. This is a critical implementation caveat: the threshold must be calibrated per embedding model and validated against the actual corpus, not copied from another system.
+
+4. **Layered memory stores.** MemGPT (LLMs as Operating Systems) and Redis agent-memory-server formalize the layered approach: a fast-access working context plus a slower, larger external memory that is paged in via retrieval. The vector-search layer is the "paging" mechanism that pulls relevant historical chunks into the prompt. Semantic-recall processors (e.g. Mastra) implement exactly this: embed each message, store embeddings, and at query time retrieve semantically similar past messages.
+
+5. **Local-first embedding.** For D2 (local-first) compliance, the embedding model runs locally (e.g. Ollama, as Incanter already uses at http://127.0.0.1:11434 with embeddinggemma). This keeps the vector-search layer fully self-hosted with no cloud dependency.
+
+6. **Injection discipline.** Only chunks above the threshold are injected into the prompt, and the injected set is bounded (a cap on the number of chunks) to control context bloat. The injected chunks are typically formatted as a "memory context" block distinct from the conversation, so the model can distinguish recalled memory from the live turn.
+
+## Key concepts glossary
+
+- **3-layer memory**: the agent-memory architecture of (1) profile summary — an executive summary of what the agent knows about the user, drafted from the facts table (a derived artifact, not a source of truth); (2) facts table — tracks every individual fact about the user (the source of truth for discrete facts); (3) vector search — every turn, embed what was said, run cosine distance, find the closest chunks under a similarity threshold, inject into the prompt.
+- **Vector search (this topic)**: the third layer. Embeds each turn, runs cosine distance against a corpus of embedded chunks, and injects only chunks whose similarity exceeds a threshold.
+- **Embedding / vectorization**: mapping a text chunk to a dense vector in a high-dimensional space such that semantically similar texts are near each other (high cosine similarity).
+- **Cosine distance / cosine similarity**: a measure of the angle between two vectors; similarity = cos(θ), ranging from -1 to 1 (often 0 to 1 after normalization). Higher = more similar. Distance = 1 − similarity.
+- **Similarity threshold**: a configurable cutoff; only chunks with similarity ≥ threshold are injected. The key precision/recall tunable.
+- **Per-exchange chunking**: chunking the corpus per user↔assistant exchange (each exchange embedded as its own precise vector) rather than embedding a whole conversation as one long vector. The dependency vectorization-chunking.
+- **Long-vector blur**: the failure mode of embedding a long transcript as one vector — the vector averages over many distinct facts and loses precise relations; the agent is slow to parse a passed response transcript. The dependency vectorization-long-vector.
+- **Injection**: inserting the retrieved above-threshold chunks into the prompt as a memory-context block so the model can use recalled memory.
+- **Facts table**: the source-of-truth store of discrete key→value facts about the user; in Familiar it is the key→value memory store upgraded with candidate-fact extraction + deterministic validation.
+- **Profile summary**: a derived executive summary regenerated from the facts table; steers orchestration.
+- **Candidate fact**: a fact extracted by a light LLM from a turn, then deterministically validated (TypeScript) before commit.
+- **MUST-2 (FAMILIAR-ASSISTANT-CORE-SCOPE)**: the decision that Familiar's memory store is distinct from knowledge memory (Astrographer's document store); vector search over memory must be a local embedding store inside Familiar, not a delegation to Astrographer/Incanter.
+- **D2 (local-first)**: the design constraint that "if it can be local, it should be local"; the embedding store must run locally.
+- **D4 (MCP-GUI parity)**: every non-security feature must have both a GUI and an MCP form; the vector-search retrieval mode must be exposed on both surfaces.
+
+## Implementation guide
+
+**Where this lands in the suite.** This is the PARKED/speculative vector-search layer of Familiar's memory store (docs/specs/familiar.md §4.1.3; docs/pending.md D6; docs/research/agent-memory-research-notes.md §3.1/§3.2). It is the third increment after the facts-table + profile-summary core ships. It is NOT a delegation to Astrographer/Incanter — it is a local embedding store inside Familiar (MUST-2, D2).
+
+**Recommended implementation steps (red → green per unit, RCA-5):**
+
+1. **Chunking (dependency vectorization-chunking).** Chunk the conversation corpus per exchange: each (user message + assistant reply) becomes one chunk. Do NOT embed a whole conversation or a long transcript as one vector (the long-vector blur the dependency vectorization-long-vector pins). Each exchange is embedded as its own precise vector. This is a conversation-model enhancement to §4.1.1 (a per-exchange chunk/embedding index).
+
+2. **Local embedding store (D2).** Use a local embedding model (mirror Incanter's local-Ollama approach, incanter.md §4.7, e.g. http://127.0.0.1:11434 embeddinggemma). Store chunk text + embedding vector + metadata (conversationId, messageId, createdAt) in a local vector index inside Familiar. No cloud dependency.
+
+3. **Query-time retrieval.** On each turn, embed the current user message (and optionally the current exchange), run cosine similarity against all stored chunk embeddings, and keep only chunks with similarity ≥ threshold. Cap the injected set (e.g. top-N above threshold) to bound context.
+
+4. **Threshold calibration (critical).** The threshold does NOT transfer across embedding models or corpora. Calibrate it per embedding model against the actual conversation corpus. Start with a conservative value and validate precision/recall empirically. Document the chosen threshold and the model it was tuned on. A threshold tuned on one model will not work on another (documented failure mode).
+
+5. **Injection.** Inject the above-threshold chunks into the prompt as a distinct memory-context block, separate from the live conversation, so the model can distinguish recalled memory from the current turn. If nothing is above threshold, inject nothing (zero-chunk is a valid state, not an error).
+
+6. **D4 parity.** The retrieval mode must be reachable through both the GUI and MCP (a retrieval-mode change, not a security feature — no carve-out). It is a data-shape/behavior change to the memory surface, not a new security surface.
+
+7. **Solomon (F7).** The per-exchange vectors feed cross-instance search: the embedding index is searchable by similarity as part of "assistant memory" (facts table primary + profile summary derived + vector store as the embedding index).
+
+**Fail-states to spec and test:** embedding model unavailable (local Ollama down) → retrieval degrades to no-injection, not an error; empty corpus → zero chunks; threshold too high → zero chunks (recall loss); threshold too low → noise/context bloat; malformed chunk metadata; index corruption. Each must be a documented fail-state a TestWriter can derive.
+
+**Parking condition.** Land only after the facts-table + profile-summary core ships (docs/pending.md D6). The Augur memory events (familiar.fact.changed) and memory-informed Horoscope grading are separate parked items that depend on the Augur schema (MUST-8) and the delegation-injection path respectively.
+
+## Per-project application notes
+
+**Familiar** — PRIMARY application. This is the vector-search layer of Familiar's memory store (§4.1.3). It is the PARKED/speculative increment (docs/pending.md D6): a local embedding store inside Familiar + per-exchange chunking over conversation turns (§4.1.1). MUST be local (D2) and NOT delegated to Astrographer/Incanter (MUST-2). Every turn, embed what was said, run cosine distance, inject only chunks above the threshold. Must be GUI + MCP (D4). Feeds Solomon cross-instance search (F7). Park until the facts-table + profile-summary core ships.
+
+**Astrographer** — No new contract change required by this topic. The per-exchange/per-fact-node chunking principle (precise per-unit vectors beat one long "blurry" vector) corroborates the already-recommended graph-structure chunking per fact node and fact-key exact-match retrieval (Pass 8 research, hybrid-search-research-notes §7). The 3-layer model maps conceptually onto Astrographer's document store (facts table = fact nodes; profile summary = derived document; vector search = RAG surface), but this is a conceptual mapping only — Astrographer is knowledge memory, distinct from Familiar's assistant memory store (MUST-2). No Astrographer contract change is needed for Familiar's memory vector search.
+
+**Incanter** — No new change required. Incanter already implements dense vector similarity fused with graph-tension (vector_weight 0.6 / graph_weight 0.4) in POST /v1/query, and already runs local embeddings via Ollama (embeddinggemma at http://127.0.0.1:11434). The per-exchange chunking guidance corroborates Incanter's dynamic-chunking prototype role. Familiar's memory vector search does NOT delegate to Incanter (MUST-2); it uses a local embedding store inside Familiar, mirroring Incanter's local-Ollama approach.
+
+**Horoscope** — No source change required. The vector-search layer is memory-side (Familiar). The only cross-tool application is memory-informed task grading, which is a separate parked item: Familiar injects the relevant profile-summary/recalled context into the delegation request to Horoscope (via Horoscope's opt-in per-widget path, §4.3), not a Horoscope contract change. The vector-search layer itself does not touch Horoscope.
+
+**Solomon** — The vector-search layer feeds F7 (cross-instance search). "Assistant memory" as a searchable instance type = the facts table (primary) + profile summary (derived) + the vector store (the embedding index, searchable by similarity). This is a refinement to the already-pinned Solomon contract change (adding `familiar` to instanceTypes, MUST-5), not a new change. The vector index is the parked layer of the searchable surface.
+
+**Augur** — No direct change from the vector-search layer itself. The related memory-coordination item is the parked `familiar.fact.changed` / `familiar.memory.updated` event on a `familiar.*` channel (F6), which would let other tools react to memory changes (e.g. Solomon re-indexing the searchable facts). That event schema is provisional and owned by the Augur contract (MUST-8); it is parked until the Augur schema finalizes. The vector-search retrieval itself does not require an Augur event.
+
+## Sources
+
+- https://docs.usesatori.sh/concepts/how-it-works
+- https://github.com/redis/agent-memory-server/blob/main/docs/long-term-memory.md
+- https://mastra.ai/docs/memory/semantic-recall
+- https://par.nsf.gov/servlets/purl/10524107
+- https://dev.to/gde03/retrieval-augmented-self-recall-part-5-the-gap-threshold-that-didnt-transfer-86a
+- https://arxiv.org/html/2601.02428v1

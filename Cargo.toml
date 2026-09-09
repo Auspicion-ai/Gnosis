@@ -1,0 +1,33 @@
+[package]
+name = "gnosis"
+version = "0.1.0"
+edition = "2021"
+description = "Production graph/vector engine for the Auspicion Suite (document store, knowledge graph, fact/citation, consistency, RAG/agent-memory retrieval)"
+license = "AGPL-3.0"
+
+[dependencies]
+# serde for the store/graph serialization + the IPC transport
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tokio async runtime for the query/stream/engine-status API + the embedding provider calls
+tokio = { version = "1", features = ["full"] }
+# sha2 for the content-hash / node-source SHA-256 discipline
+sha2 = "0.10"
+# reqwest for the embedding/LLM provider (Ollama) HTTP calls
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# futures for the SSE stream surface
+futures = "0.3"
+
+[dev-dependencies]
+# tokio test support
+tokio = { version = "1", features = ["full", "test-util"] }
+# mocking the embedding provider HTTP layer in tests (no live remote call in CI)
+wiremock = "0.6"
+
+[[bin]]
+name = "gnosis"
+path = "src/main.rs"
+
+[lib]
+name = "gnosis"
+path = "src/lib.rs"
