@@ -17,7 +17,7 @@ must respect; (b) DEFERRED — lower-value gaps parked until a use case surfaces
 
 | Item | Disposition |
 | --- | --- |
-| **F2 — engine transport/API reconciliation** | The exact IPC/process transport between the shell and Gnosis is not yet pinned to a concrete wire format (spec §7.2). Design at the shell seam unit. |
+| **F2 — engine transport/API reconciliation** | **SUPERSEDED IN PART (2026-09-09) — F2 LANDED.** The mechanism-agnostic **wire contract** (the §7.2 F2 engine seam) is now implemented + green (`docs/specs/engine-wire-contract.md`, `src/wire/`, `tests/wire_conformance.rs` + `tests/props_wire.rs`; see `docs/next-steps.md` F2 DONE row). What remains deferred is the **transport mechanism** — the exact HTTP-over-native-IPC server + shell-side SSE client + bind/auth/TLS + full `RagStore` CRUD routing + boot→READY lifecycle + HTTP-status rendering + D2-absent shell behavior — which is owned by a **later Astrographer-shell integration unit** (recorded in `docs/specs/7-2-f2-review.md` §"Deferred / OUT of F2", `docs/specs/engine-wire-contract.md` §2/§14, decision `F2-WIRE-CONTRACT-A1`). Design at the shell seam unit. |
 | **F3 — Adaptive RAG routing to Zodiac** | **PARKED** (spec §7.4): a query-complexity router; land after the MUST/SHOULD retrieval foundation. |
 | **F4 — Community summaries** | **PARKED** (spec §7.5): the *automatic* community detection + summary generation; the **manual** `declareCommunity` override is a pinned requirement (§4.2.8). |
 | **F5 — LLM-generated dynamic graph query** | **PARKED** (spec §7.6): gated on a graph-query substrate the suite lacks. |

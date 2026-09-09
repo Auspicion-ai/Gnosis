@@ -2,12 +2,7 @@
 //!
 //! Mechanism-agnostic codecs + validation + single-event SSE + health +
 //! versioned envelope layer for the Astrographrer-shell → Gnosis-engine proxy
-//! seam. Contract: `docs/specs/engine-wire-contract.md`.
-//!
-//! **RED-stage stub skeleton.** This module's function bodies are `todo!()` /
-//! `Err` placeholders inserted by the TestWriter so the crate compiles and the
-//! conformance + property tests fail red. The F2 Implementer replaces the
-//! bodies with the real logic (matching these exact signatures) to go green.
+//! seam. Contract: `docs/specs/engine-wire-contract.md` (GREEN — 360 tests).
 
 pub mod codecs;
 pub mod decode;

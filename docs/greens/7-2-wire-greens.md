@@ -108,6 +108,22 @@ alone.
 
 ## RED — contract/impl discrepancy (must go back)
 
+> **RESOLVED (2026-09-09, doc-review reconciliation).** This RED was **resolved as a
+> contract-precedence DOC-fix, not a code defect** — see note under finding 1. The
+> contract (`docs/specs/engine-wire-contract.md`) was tightened to pin the
+> observed precedence: §7's `decode_rag_result` and §12 **V-9 "Precedence (pinned)"**
+> now state that trace-`key`-presence is checked **before** structural
+> deserialization, so a malformed-and-traceless body (`{"query":123}`) yields
+> `MissingTrace` → FS-10 `TraceUnavailable` (with both codes mapping to HTTP 502,
+> so the rendered shell status is identical). `src/wire/decode.rs:45-55` is verified
+> to implement exactly that (returns `MissingTrace` only when no `trace` key exists,
+> before `serde_json::from_value`). Finding 2 (empty-object `{}` → `UnknownType`) is
+> likewise folded into the reconciliation as GREEN-with-note: the §13 "Empty payload"
+> bullet is satisfied by the net `EngineError` outcome, and `decode_chunk_payload`
+> (`src/wire/decode.rs:71-111`) rejects the extra-key done frame and the typeless
+> `{}` payload as documented. **No code defect was introduced; the blind-greens
+> result stands as 50 GREEN / 1 RED (resolved as doc-fix) / 3 NOT-VERIFIED.**
+
 **1. `decode_rag_result` precedence when a body is *both* malformed and trace-less.** The
 contract (§7, §13, V-9) pins: "structurally malformed (wrong field types …) → `InvalidJson` →
 `EngineError` outcome" and "structurally **well-formed** but trace absent → `MissingTrace` →

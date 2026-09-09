@@ -2,15 +2,14 @@
 
 - **Unit:** §7.2 F2 — engine transport/API reconciliation (the last OPEN unit in
   `docs/next-steps.md`).
-- **Status:** **CONTRACT (PLANNED-for-F2)** — this is the behavior contract the
-  F2 unit's TestWriter derives its red set from, and the wire schema the
+- **Status:** **CONTRACT (REALIZED-GREEN — landed 2026-09-09)** — this is the behavior
+  contract the F2 unit's TestWriter derives its red set from, and the wire schema the
   Astrographer shell will implement identically. It pins the codec + validation
   + SSE + health + envelope layer **only**. It does **not** build a server, does
   **not** add runtime dependencies, and does **not** mutate the frozen §4.1/§4.5
-  types.
+  types. The F2 unit shipped green (**360 total tests**) matching §1–§13.
 - **Gate:** proposal-review **PASSED** — Architecture A1 (`7-2-f2-review.md`,
-  decision `F2-WIRE-CONTRACT-A1`). Code/contract delegation awaits the user's
-  go-ahead.
+  decision `F2-WIRE-CONTRACT-A1`). Delegation is complete; the unit is implemented.
 - **Contract cross-refs:** `docs/specs/gnosis.md` §4.6.1 (the retrieval trio),
   §4.1.5 (`RagStore` persistence seam — the wire covers the **retrieval trio**,
   not CRUD), §4.1.4/FS-4 (`ConflictError` = HTTP 409), §4.3.4 (audit), §6

@@ -8,8 +8,7 @@
 - **Verdict:** **PASS — scoped per Architecture A1** (mechanism-agnostic wire
   contract + encoding layer), contingent on the user's go-ahead. Not a
   GATE-DECISION: F2 ships real tested artifacts.
-- **Status:** proposal approved by review; code/contract delegation awaits the
-  user's go-ahead.
+- **Status:** proposal approved by review; **LANDED + GREEN (2026-09-09)** — the scoped A1 deliverable was implemented in `src/wire/` with `tests/wire_conformance.rs` (57) + `tests/props_wire.rs` (8); **360 total tests** green, clippy/fmt clean. See `docs/next-steps.md` F2 DONE row + decision `F2-WIRE-CONTRACT-A1`.
 
 ## What F2 is
 

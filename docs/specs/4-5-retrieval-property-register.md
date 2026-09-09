@@ -3,7 +3,7 @@
 - **Unit:** §4.5 RAG/agent-memory retrieval (query modes `flat`/`graph`/`vector`/`hybrid`, retrieval stack, agent-memory retrieval). **Spec:** `docs/specs/gnosis.md` §4.5.1–§4.5.3a, §4.6.1; the pure RRF merge is §4.5.3 "RRF fusion".
 - **Scope/API:** `src/store/mod.rs` retrieval surface + `src/retrieval/mod.rs` (`rrf_fuse`, `RRF_K`) re-exported from `src/lib.rs` (`pub use self::retrieval::{rrf_fuse, RRF_K};` and `pub use self::store::{ RagQueryOptions, MultiQueryOptions, CompressionMode, ExpandMode, SubTaskDagOptions, FirstPassOptions, QueryMode, RagResult, RagResultItem, RagTrace, RagChunk, RagStream, Source, RagParent, BlockedBy, QueryAuditFilters, Store, RagStore, StoreError, DocumentId, NodeId, WikiId, VectorIndex, FieldType, DerivedIndexes, EmbeddingProvider, … }`).
 - **Exercised by:** the §4.5 green example suite — `tests/rag_query_integration.rs`, `tests/retrieval_stack_integration.rs`, `tests/agent_memory_integration.rs`.
-- **Date:** 2026-09-12. **Role:** spec_writer (this register is the PBT-gate artifact **#1** of 3).
+- **Date:** 2026-09-09. **Role:** spec_writer (this register is the PBT-gate artifact **#1** of 3).
 - **Status:** PBT-gate artifact #1 — the typed property register. Artifacts #2 (executed property layer, TestWriter) and #3 (read-only PBT audit, adversarial reviewer) are separate passes.
 
 ## PBT-gate note
