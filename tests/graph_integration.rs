@@ -59,6 +59,38 @@ fn nid(s: &str) -> NodeId {
     NodeId(s.to_string())
 }
 
+/// Assert `s` matches exactly the ISO-8601 UTC shape the crate's `iso_now()`
+/// emits (§4.1.1/§4.3.1): `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ` (9 fractional digits
+/// + trailing `Z`). Manual shape check (no `regex` dep in `Cargo.toml`).
+///
+/// DOC-REVIEW QUICK-PIN (docs/pending.md): the `Triple.createdAt` and
+/// merge-produced `Fact.updatedAt` formats are pinned, not just non-empty.
+fn assert_iso8601_utc(s: &str) {
+    let b = s.as_bytes();
+    assert_eq!(
+        b.len(),
+        30,
+        "ISO-8601 UTC must be 30 chars, got {s:?} (len {})",
+        b.len()
+    );
+    for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9] {
+        assert!(b[i].is_ascii_digit(), "pos {i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[4], b'-', "pos 4 of {s:?} must be '-'");
+    assert_eq!(b[7], b'-', "pos 7 of {s:?} must be '-'");
+    assert_eq!(b[10], b'T', "pos 10 of {s:?} must be 'T'");
+    for &i in &[11usize, 12, 14, 15, 17, 18] {
+        assert!(b[i].is_ascii_digit(), "pos {i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[13], b':', "pos 13 of {s:?} must be ':'");
+    assert_eq!(b[16], b':', "pos 16 of {s:?} must be ':'");
+    assert_eq!(b[19], b'.', "pos 19 of {s:?} must be '.'");
+    for (frac_i, &c) in b.iter().enumerate().take(29).skip(20) {
+        assert!(c.is_ascii_digit(), "pos {frac_i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[29], b'Z', "pos 29 of {s:?} must be 'Z' (UTC)");
+}
+
 fn content_node(doc: &DocumentId, node: &str, value: &str) -> Node {
     Node {
         document_id: doc.clone(),
@@ -690,6 +722,9 @@ async fn add_triple_stores_relation_edge_in_document() {
     assert_eq!(triple.object, (doc.document_id.clone(), nid("n2")));
     assert_eq!(triple.relation_type, "depends_on");
     assert!(!triple.created_at.is_empty(), "createdAt must be set");
+    // DOC-REVIEW QUICK-PIN: the `Triple.createdAt` is ISO-8601 UTC
+    // (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`), not just non-empty.
+    assert_iso8601_utc(&triple.created_at);
 
     // It is a `relation` edge owned by the graph (§4.2.7.2), retrievable via
     // adjacency — not an external index.
@@ -2070,6 +2105,9 @@ async fn merge_facts_persists_merged_fact_to_store() {
         .await
         .unwrap();
     assert_eq!(merged.citations.len(), 3);
+    // DOC-REVIEW QUICK-PIN: a `merge_facts`-produced `Fact`'s `updatedAt` is
+    // ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`), refreshed by the merge.
+    assert_iso8601_utc(&merged.updated_at);
 
     // The merge must be durable: read the canonical fact back from the store.
     let persisted = store.get_fact(&w, "license").await.expect(

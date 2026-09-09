@@ -408,6 +408,78 @@ async fn rag_query_multi_query_n_zero_is_validation_error() {
     assert!(matches!(err, StoreError::ValidationError(_)));
 }
 
+/// DOC-REVIEW QUICK-PIN (docs/pending.md · FS-19): `MultiQueryExpansionFailed`
+/// is reachable and asserted. A `multiQuery:{enabled:true, n>=2}` fan-out over
+/// a wiki whose `term_popularity` yields **no distinct indexable term** (an
+/// empty wiki → `term_popularity` has nothing to add) → `MultiQueryExpansionFailed`
+/// (§4.5.3/§4.6.1). This is the one engine-internal fail-state that a typed
+/// test can drive with no seam.
+#[tokio::test]
+async fn rag_query_multi_query_empty_wiki_is_expansion_failed() {
+    let store = Arc::new(Store::new());
+    // An empty wiki: created but carrying no documents, so `term_popularity`
+    // over `wiki_id: Some(w)` yields zero distinct candidate terms to fan out to.
+    let w = new_wiki(&store, "empty").await;
+    ready(&store);
+    let err = store
+        .rag_query(
+            "some query",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                mode: Some(QueryMode::Flat),
+                multi_query: Some(MultiQueryOptions {
+                    enabled: true,
+                    n: 2,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::MultiQueryExpansionFailed,
+        "multi-query fan-out with no distinct term to add must fail (FS-19)"
+    );
+}
+
+/// DOC-REVIEW QUICK-PIN (docs/pending.md · §4.6.1): the stream surface routes
+/// the same `MultiQueryExpansionFailed` fail-state to an `Error` chunk. `rag_stream`
+/// calls `rag_query` and maps its `Err` to `RagChunk::Error`, then `Done`.
+#[tokio::test]
+async fn rag_stream_multi_query_empty_wiki_emits_error_chunk() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "empty").await;
+    ready(&store);
+    let stream = store
+        .rag_stream(
+            "some query",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                mode: Some(QueryMode::Flat),
+                multi_query: Some(MultiQueryOptions {
+                    enabled: true,
+                    n: 2,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let chunks: Vec<RagChunk> = stream.collect().await;
+    assert!(
+        chunks
+            .iter()
+            .any(|c| matches!(c, RagChunk::Error(StoreError::MultiQueryExpansionFailed))),
+        "stream must emit the MultiQueryExpansionFailed Error chunk (§4.6.1)"
+    );
+    assert_eq!(
+        chunks.last(),
+        Some(&RagChunk::Done),
+        "stream closes after the error chunk"
+    );
+}
+
 /// Fail-state FS-3 (§4.5.3a.4/§4.6.1): `binaryCandidatePool` not a positive
 /// integer (`0`) → `ValidationError`.
 #[tokio::test]

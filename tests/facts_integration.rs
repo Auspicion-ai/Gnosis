@@ -83,6 +83,38 @@ fn nid(s: &str) -> NodeId {
     NodeId(s.to_string())
 }
 
+/// Assert `s` matches exactly the ISO-8601 UTC shape the crate's `iso_now()`
+/// emits (§4.1.1/§4.3.1): `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ` (9 fractional digits
+/// + trailing `Z`). Manual shape check (no `regex` dep in `Cargo.toml`).
+///
+/// DOC-REVIEW QUICK-PIN (docs/pending.md): the fact `updatedAt` format is
+/// pinned, not just non-empty.
+fn assert_iso8601_utc(s: &str) {
+    let b = s.as_bytes();
+    assert_eq!(
+        b.len(),
+        30,
+        "ISO-8601 UTC must be 30 chars, got {s:?} (len {})",
+        b.len()
+    );
+    for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9] {
+        assert!(b[i].is_ascii_digit(), "pos {i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[4], b'-', "pos 4 of {s:?} must be '-'");
+    assert_eq!(b[7], b'-', "pos 7 of {s:?} must be '-'");
+    assert_eq!(b[10], b'T', "pos 10 of {s:?} must be 'T'");
+    for &i in &[11usize, 12, 14, 15, 17, 18] {
+        assert!(b[i].is_ascii_digit(), "pos {i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[13], b':', "pos 13 of {s:?} must be ':'");
+    assert_eq!(b[16], b':', "pos 16 of {s:?} must be ':'");
+    assert_eq!(b[19], b'.', "pos 19 of {s:?} must be '.'");
+    for (frac_i, &c) in b.iter().enumerate().take(29).skip(20) {
+        assert!(c.is_ascii_digit(), "pos {frac_i} of {s:?} must be a digit");
+    }
+    assert_eq!(b[29], b'Z', "pos 29 of {s:?} must be 'Z' (UTC)");
+}
+
 fn content_node(doc: &DocumentId, node: &str, value: &str) -> Node {
     Node {
         document_id: doc.clone(),
@@ -329,6 +361,9 @@ async fn get_fact_returns_stored_fact() {
     assert_eq!(got.document_id, doc.document_id);
     assert_eq!(got.node_id, nid("fact-license"));
     assert!(!got.updated_at.is_empty(), "updatedAt is set (ISO-8601)");
+    // DOC-REVIEW QUICK-PIN: a `create_fact`-produced `Fact`'s `updatedAt` is
+    // ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`), not just non-empty.
+    assert_iso8601_utc(&got.updated_at);
     assert_eq!(got.citations, vec![(doc.document_id.clone(), nid("n1"))]);
 }
 
@@ -540,6 +575,9 @@ async fn update_fact_changes_value_and_citations() {
         updated.updated_at >= created.updated_at,
         "updatedAt refreshes"
     );
+    // DOC-REVIEW QUICK-PIN: an `update_fact`-produced `Fact`'s refreshed
+    // `updatedAt` is ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`).
+    assert_iso8601_utc(&updated.updated_at);
     assert_eq!(updated.fact_key, "license");
 }
 
