@@ -16,7 +16,10 @@ pub mod store; // §4.1 document store (persistence, RAG store interface)
 
 // §4.1 document-store public API surface (re-exported for the shell / tests).
 pub use self::store::{
-    CreateDocumentRequest, DocState, Document, DocumentId, DocumentList, DocumentSummary, Edge,
-    EdgeKind, Graph, ListDocumentsFilter, Node, NodeId, NodeKind, RagStore, ReferenceState, Store,
-    StoreError, UpdateDocumentRequest, Wiki, WikiId,
+    Alias, Community, CommunityId, CreateDocumentRequest, DeclareCommunityOptions, DocState,
+    Document, DocumentId, DocumentList, DocumentSummary, Edge, EdgeKind, EntityPair, Fact,
+    GetTriplesFilter, Graph, ListDocumentsFilter, MergeFactsOptions, Node, NodeId, NodeKind,
+    QueryTriplesOptions, RagStore, ReferenceState, ResolutionResult, ResolveEntitiesOptions,
+    ResolveOptions, ResolvedFact, Store, StoreError, Triple, TripleDirection, TriplePattern,
+    UpdateDocumentRequest, Wiki, WikiId,
 };

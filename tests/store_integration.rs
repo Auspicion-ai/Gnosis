@@ -53,6 +53,7 @@ fn valid_graph() -> Graph {
                 kind: EdgeKind::DocHead,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
             Edge {
                 source: (doc_id("d1"), n1.node_id.clone()),
@@ -60,6 +61,7 @@ fn valid_graph() -> Graph {
                 kind: EdgeKind::DocEnd,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
         ],
     }
@@ -83,6 +85,7 @@ fn graph_with_broken_reference() -> Graph {
         kind: EdgeKind::Link,
         state: Some(ReferenceState::Broken),
         cross_wiki: false,
+        relation_type: None,
     });
     g
 }
@@ -96,6 +99,7 @@ fn graph_with_stale_embed() -> Graph {
         kind: EdgeKind::Embed,
         state: Some(ReferenceState::Stale),
         cross_wiki: false,
+        relation_type: None,
     });
     g
 }
@@ -109,6 +113,7 @@ fn graph_with_crosslink() -> Graph {
         kind: EdgeKind::Crosslink,
         state: Some(ReferenceState::Resolved),
         cross_wiki: true,
+        relation_type: None,
     });
     g
 }
@@ -169,6 +174,7 @@ fn graph_with_link_to(self_id: &DocumentId, target_id: &DocumentId) -> Graph {
                 kind: EdgeKind::DocHead,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
             Edge {
                 source: (self_id.clone(), n1.node_id.clone()),
@@ -176,6 +182,7 @@ fn graph_with_link_to(self_id: &DocumentId, target_id: &DocumentId) -> Graph {
                 kind: EdgeKind::DocEnd,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
             Edge {
                 source: (self_id.clone(), ref1.node_id.clone()),
@@ -183,6 +190,7 @@ fn graph_with_link_to(self_id: &DocumentId, target_id: &DocumentId) -> Graph {
                 kind: EdgeKind::Link,
                 state: Some(ReferenceState::Resolved),
                 cross_wiki: false,
+                relation_type: None,
             },
         ],
     }
@@ -208,6 +216,7 @@ fn graph_with_crosslink_state(state: ReferenceState) -> Graph {
         kind: EdgeKind::Crosslink,
         state: Some(state),
         cross_wiki: true,
+        relation_type: None,
     });
     g
 }
@@ -238,6 +247,7 @@ fn graph_with_non_reference_edge_to(
                 kind: EdgeKind::DocHead,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
             Edge {
                 source: (self_id.clone(), n1.node_id.clone()),
@@ -245,6 +255,7 @@ fn graph_with_non_reference_edge_to(
                 kind: EdgeKind::DocEnd,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
             Edge {
                 source: (self_id.clone(), n1.node_id.clone()),
@@ -252,6 +263,7 @@ fn graph_with_non_reference_edge_to(
                 kind,
                 state: None,
                 cross_wiki: false,
+                relation_type: None,
             },
         ],
     }
