@@ -41,17 +41,13 @@ use std::sync::Arc;
 use gnosis::{
     CompressionMode, CreateDocumentRequest, DerivedIndexes, Document, DocumentId, Edge, EdgeKind,
     EmbeddingProvider, FieldType, FirstPassOptions, Graph, MultiQueryOptions, Node, NodeId,
-    NodeKind, QueryAuditFilters, QueryMode, RagQueryOptions, RagStore, Store, StoreError,
-    UpdateDocumentRequest, VectorIndex, WikiId,
+    NodeKind, QueryAuditFilters, QueryMode, RagQueryOptions, RagResult, RagStore, Store,
+    StoreError, UpdateDocumentRequest, VectorIndex, WikiId,
 };
 
 // ---------------------------------------------------------------------------
 // Helpers (mirroring the other suites)
 // ---------------------------------------------------------------------------
-
-fn did(s: &str) -> DocumentId {
-    DocumentId(s.to_string())
-}
 
 fn nid(s: &str) -> NodeId {
     NodeId(s.to_string())
@@ -144,6 +140,28 @@ fn seed_vectors(store: &Store, entries: Vec<((DocumentId, NodeId), Vec<f32>)>) {
     });
 }
 
+/// Create a real document in `w` with a single content node and return its
+/// real `(documentId, nodeId)`. Vector tests MUST seed the vector index under
+/// real documents that belong to the queried wiki — synthetic ids that map to no
+/// document would break once `vector_search` is wiki-scoped (MEDIUM-5).
+async fn new_content_doc(
+    store: &Store,
+    w: &WikiId,
+    title: &str,
+    node: &str,
+    value: &str,
+) -> (DocumentId, NodeId) {
+    let doc = new_doc(store, w, title).await;
+    update_graph(
+        store,
+        &doc,
+        vec![content_node(&doc.document_id, node, value)],
+        vec![],
+    )
+    .await;
+    (doc.document_id, nid(node))
+}
+
 // ---------------------------------------------------------------------------
 // Embedding-provider mocks
 // ---------------------------------------------------------------------------
@@ -188,6 +206,35 @@ impl EmbeddingProvider for MockProvider {
     fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let a = self.available;
         Box::pin(async move { a })
+    }
+}
+
+/// A **text-sensitive** deterministic provider that proves HyDE actually routes
+/// the HyDE-*hypothetical* text through `embed` (de-vacuation of the weak
+/// constant-vector mock, §4.5.3 re-audit LOW-F). It returns **distinct known
+/// vectors** for the HyDE hypothetical (`"{query} relevant passage"`, the
+/// engine's §4.5.3 deterministic stand-in) vs the plain query text. Same input →
+/// same vector (deterministic). This makes `hyde:true` vs `hyde:false`
+/// distinguishable: only `hyde:true` embeds the hypothetical text and therefore
+/// surfaces the node whose vector equals the hypothetical's vector.
+struct HydeSensitiveProvider;
+
+impl EmbeddingProvider for HydeSensitiveProvider {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, StoreError>> + Send + '_>> {
+        // The §4.5.3 HyDE stand-in the engine embeds under `hyde: true`.
+        const HYPOTHETICAL: &str = "hypothetical relevant passage";
+        let v: Vec<f32> = if text == HYPOTHETICAL {
+            vec![1.0, 0.0]
+        } else {
+            vec![0.0, 1.0]
+        };
+        Box::pin(async move { Ok(v) })
+    }
+    fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
     }
 }
 
@@ -271,16 +318,19 @@ async fn bm25_search_lexical_index_not_built_is_unavailable() {
 // ---------------------------------------------------------------------------
 
 /// State: `vector_search` embeds the query via the provider and returns top-k
-/// candidates from the vector snapshot ordered by cosine similarity.
+/// candidates from the vector snapshot ordered by cosine similarity. The vectors
+/// are seeded under REAL docs that belong to the queried wiki (MEDIUM-5).
 #[tokio::test]
 async fn vector_search_returns_top_k_by_cosine_similarity() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    let (d2, n2) = new_content_doc(&store, &w, "d2", "b1", "beta").await;
     seed_vectors(
         &store,
         vec![
-            ((did("d1"), nid("n1")), vec![1.0, 0.0]),
-            ((did("d2"), nid("n1")), vec![0.5, 0.5]),
+            ((d1.clone(), n1.clone()), vec![1.0, 0.0]),
+            ((d2, n2), vec![0.5, 0.5]),
         ],
     );
     let fp = FirstPassOptions {
@@ -293,16 +343,18 @@ async fn vector_search_returns_top_k_by_cosine_similarity() {
         .unwrap();
     assert_eq!(hits.len(), 2);
     // Most similar first.
-    assert_eq!(hits[0].document_id, did("d1"));
+    assert_eq!(hits[0].document_id, d1);
+    assert_eq!(hits[0].node_id, n1);
 }
 
 /// Fail-state FS-13: a vector leg whose embedding provider is unreachable →
-/// `EmbeddingUnavailable`.
+/// `EmbeddingUnavailable`. (Vector seeded under a real doc in the queried wiki.)
 #[tokio::test]
 async fn vector_search_embedding_provider_unreachable_is_unavailable() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    seed_vectors(&store, vec![((did("d1"), nid("n1")), vec![1.0, 0.0])]);
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "n1", "alpha").await;
+    seed_vectors(&store, vec![((d1, n1), vec![1.0, 0.0])]);
     let fp = FirstPassOptions {
         binary_first_pass: false,
         binary_candidate_pool: 0,
@@ -320,7 +372,8 @@ async fn vector_search_embedding_provider_unreachable_is_unavailable() {
 async fn vector_search_vector_index_not_built_is_unavailable() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    // Fresh snapshot → no vector index.
+    // A real doc so the wiki "has documents", but NO vector index is seeded.
+    let _ = new_content_doc(&store, &w, "d0", "n0", "alpha").await;
     let fp = FirstPassOptions {
         binary_first_pass: false,
         binary_candidate_pool: 0,
@@ -339,16 +392,18 @@ async fn vector_search_vector_index_not_built_is_unavailable() {
 async fn vector_search_binary_first_pass_narrows_pool_then_full_cosine() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    // Seed a multi-field vector index: full + binary for two nodes.
+    // Seed a multi-field vector index: full + binary for two real docs in `w`.
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    let (d2, n2) = new_content_doc(&store, &w, "d2", "b1", "beta").await;
     let mut vi = VectorIndex::default();
     vi.entries
-        .insert((did("d1"), nid("n1"), FieldType::Full), vec![1.0, 0.0]);
+        .insert((d1.clone(), n1.clone(), FieldType::Full), vec![1.0, 0.0]);
     vi.entries
-        .insert((did("d1"), nid("n1"), FieldType::Binary), vec![1.0, 0.0]);
+        .insert((d1.clone(), n1.clone(), FieldType::Binary), vec![1.0, 0.0]);
     vi.entries
-        .insert((did("d2"), nid("n1"), FieldType::Full), vec![0.0, 1.0]);
+        .insert((d2.clone(), n2.clone(), FieldType::Full), vec![0.0, 1.0]);
     vi.entries
-        .insert((did("d2"), nid("n1"), FieldType::Binary), vec![0.0, 1.0]);
+        .insert((d2.clone(), n2, FieldType::Binary), vec![0.0, 1.0]);
     store.swap_snapshot(DerivedIndexes {
         lexical: None,
         vectors: Some(vi),
@@ -365,7 +420,7 @@ async fn vector_search_binary_first_pass_narrows_pool_then_full_cosine() {
         .unwrap();
     assert_eq!(hits.len(), 2);
     // The full-field cosine orders d1 (most similar to [1,0,0]) first.
-    assert_eq!(hits[0].document_id, did("d1"));
+    assert_eq!(hits[0].document_id, d1);
 }
 
 /// State (§4.5.3a.4): a `binaryFirstPass` when the `binary` field/index is not
@@ -374,8 +429,10 @@ async fn vector_search_binary_first_pass_narrows_pool_then_full_cosine() {
 async fn vector_search_binary_first_pass_degrades_to_full_when_binary_unbuilt() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    // Only `full` fields are built (binary is optional/additive).
-    seed_vectors(&store, vec![((did("d1"), nid("n1")), vec![1.0, 0.0])]);
+    // Only `full` fields are built (binary is optional/additive) — seeded under
+    // a real doc in `w`.
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    seed_vectors(&store, vec![((d1, n1), vec![1.0, 0.0])]);
     let fp = FirstPassOptions {
         binary_first_pass: true,
         binary_candidate_pool: 10,
@@ -390,13 +447,136 @@ async fn vector_search_binary_first_pass_degrades_to_full_when_binary_unbuilt() 
     );
 }
 
+/// State (§4.5.3a.3 / LOW-G): `binaryFirstPass: true` with
+/// `binaryCandidatePool: None` must apply the spec's default **10× topK** as the
+/// coarse first-pass candidate-pool cap. Seed more than 10×topK candidates whose
+/// binary ranking places the true full-cosine best hit BEYOND the 10×topK
+/// boundary; the default cap must bound the pool to 10×topK, narrowing that best
+/// hit OUT before the second-pass full cosine.
+/// RED today: `rag_query` maps `binaryCandidatePool: None` to `0`, and a `0`
+/// candidate pool is treated as UNCAPPED (all candidates pass to the full
+/// cosine), so the best full hit flows through — the spec default is not applied.
+#[tokio::test]
+async fn binary_candidate_pool_none_default_caps_pool_at_tenx_topk() {
+    use gnosis::RagResult;
+
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+    let top_k = 2u64;
+    // DEFAULT_CAP (20) = 10× topK (topK = 2). Seed DEFAULT_CAP candidates ranked
+    // best-by-binary (Hamming 0) — they exactly fill the 10×topK = 20 pool and
+    // exhaust its budget. WORSE (2) further Hamming-1 candidates bring the total
+    // to 22 (> 10×topK) and rank the true best at binary position 21 — BEYOND the
+    // 20-wide pool boundary.
+    const DEFAULT_CAP: usize = 20;
+    const WORSE: usize = 2;
+
+    let mut vi = VectorIndex::default();
+    for i in 0..DEFAULT_CAP {
+        let (d, n) = new_content_doc(
+            &store,
+            &w,
+            &format!("b-{i}"),
+            &format!("nb-{i}"),
+            "unrelated",
+        )
+        .await;
+        vi.entries
+            .insert((d.clone(), n.clone(), FieldType::Full), vec![0.0, 1.0]);
+        // Hamming 0 vs the binary code of the query vector [1,0,0] → top-ranked,
+        // filling the 10×topK pool with the coarser (non-best) candidates.
+        vi.entries
+            .insert((d.clone(), n.clone(), FieldType::Binary), vec![1.0, 0.0]);
+    }
+    // The TRUE full-cosine best hit (its `full` vector IS the query vector), but
+    // its binary code (Hamming 1) ranks it 21st — beyond the default 10×topK cap.
+    let mut best_hit: Option<(DocumentId, NodeId)> = None;
+    for i in 0..WORSE {
+        let (d, n) = new_content_doc(
+            &store,
+            &w,
+            &format!("w-{i}"),
+            &format!("nw-{i}"),
+            "unrelated",
+        )
+        .await;
+        if i == 0 {
+            vi.entries
+                .insert((d.clone(), n.clone(), FieldType::Full), vec![1.0, 0.0]);
+            best_hit = Some((d.clone(), n.clone()));
+        } else {
+            vi.entries
+                .insert((d.clone(), n.clone(), FieldType::Full), vec![0.0, 1.0]);
+        }
+        // Hamming 1 vs the query binary code → outranked, beyond the 10×topK cap.
+        vi.entries
+            .insert((d.clone(), n.clone(), FieldType::Binary), vec![1.0, 1.0]);
+    }
+    let (best_doc, best_node) = best_hit.expect("seeded the full-cosine best");
+    store.swap_snapshot(DerivedIndexes {
+        lexical: None,
+        vectors: Some(vi),
+        epoch: 1,
+    });
+    store.set_embedding_provider(Arc::new(MockProvider::ok()));
+    store.set_engine_state(gnosis::EngineState::Ready);
+
+    let contains_best = |res: &RagResult| {
+        res.results
+            .iter()
+            .any(|r| r.document_id == best_doc && r.node_id == best_node)
+    };
+    let opts = |binary_first_pass: bool, pool: Option<u64>| RagQueryOptions {
+        wiki_id: Some(w.clone()),
+        top_k: Some(top_k),
+        mode: Some(QueryMode::Vector),
+        binary_first_pass: Some(binary_first_pass),
+        binary_candidate_pool: pool,
+        ..Default::default()
+    };
+
+    // CONTROL: no coarse pass → the flat full cosine over ALL candidates surfaces
+    // the true best hit, so its absence elsewhere is specifically the cap.
+    let flat = store
+        .rag_query("qq-unmatched", &opts(false, None))
+        .await
+        .unwrap();
+    assert!(
+        contains_best(&flat),
+        "sanity: without a binary first pass the full-cosine best IS a reachable hit"
+    );
+    // CONTROL: an explicitly uncapped pool likewise keeps it.
+    let uncapped = store
+        .rag_query("qq-unmatched", &opts(true, Some(u64::MAX)))
+        .await
+        .unwrap();
+    assert!(
+        contains_best(&uncapped),
+        "sanity: an explicitly uncapped candidate pool keeps the best hit"
+    );
+
+    // THE ASSERTION: `binaryCandidatePool: None` must cap the binary pool at
+    // 10×topK, EXCLUDING the beyond-cap best hit.
+    let capped = store
+        .rag_query("qq-unmatched", &opts(true, None))
+        .await
+        .unwrap();
+    assert!(
+        !contains_best(&capped),
+        "binaryCandidatePool: None must apply the spec default 10×topK cap and bound the \
+         candidate pool — the best full hit lies beyond the cap and must be excluded \
+         (it is currently treated as an uncapped pool)"
+    );
+}
+
 /// Fail-state (§4.5.3a.4 / FS-3): an invalid `binaryCandidatePool` (`0`) →
 /// `ValidationError`.
 #[tokio::test]
 async fn vector_search_binary_candidate_pool_zero_is_validation_error() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    seed_vectors(&store, vec![((did("d1"), nid("n1")), vec![1.0, 0.0])]);
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    seed_vectors(&store, vec![((d1, n1), vec![1.0, 0.0])]);
     let fp = FirstPassOptions {
         binary_first_pass: true,
         binary_candidate_pool: 0,
@@ -430,7 +610,8 @@ async fn wiremock_http_embedding_provider_serves_the_vector_seam() {
 
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    seed_vectors(&store, vec![((did("d1"), nid("n1")), vec![1.0, 0.0])]);
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    seed_vectors(&store, vec![((d1, n1), vec![1.0, 0.0])]);
     let fp = FirstPassOptions {
         binary_first_pass: false,
         binary_candidate_pool: 0,
@@ -455,7 +636,8 @@ async fn wiremock_http_embedding_provider_404_is_embedding_unavailable() {
     };
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    seed_vectors(&store, vec![((did("d1"), nid("n1")), vec![1.0, 0.0])]);
+    let (d1, n1) = new_content_doc(&store, &w, "d1", "a1", "alpha").await;
+    seed_vectors(&store, vec![((d1, n1), vec![1.0, 0.0])]);
     let fp = FirstPassOptions {
         binary_first_pass: false,
         binary_candidate_pool: 0,
@@ -471,25 +653,79 @@ async fn wiremock_http_embedding_provider_404_is_embedding_unavailable() {
 // §4.5.3 Multi-query / compression / HyDE / rerank (via ragQuery — RED stub)
 // ---------------------------------------------------------------------------
 
-/// State: multi-query fan-out (`multiQuery.enabled`, `n` variants) merges by
-/// stable `(documentId, nodeId)` identity (exact, not fuzzy) — no duplicates.
+/// State (MEDIUM-5, §4.5.3): `vector_search` is **wiki-scoped** — vectors
+/// hosted under documents that belong to wiki A are NOT returned when querying
+/// wiki B (no cross-wiki leakage).
+/// RED today: `vector_search` ignores `_wiki_id`, so a wiki-B query returns the
+/// wiki-A vectors.
 #[tokio::test]
-async fn multi_query_merges_variants_by_stable_node_identity() {
+async fn vector_search_does_not_leak_vectors_across_wikis() {
+    let store = Arc::new(Store::new());
+    let wa = new_wiki(&store, "A").await;
+    let wb = new_wiki(&store, "B").await;
+    // A real doc in wiki A with a seeded vector; wiki B owns no vectors at all.
+    let (da, na) = new_content_doc(&store, &wa, "d-a", "n1", "alpha").await;
+    let _ = new_content_doc(&store, &wb, "d-b", "n1", "alpha").await;
+    seed_vectors(&store, vec![((da, na), vec![1.0, 0.0])]);
+
+    let fp = FirstPassOptions {
+        binary_first_pass: false,
+        binary_candidate_pool: 0,
+    };
+    let hits = store
+        .vector_search(&wb, "q", 5, &MockProvider::ok(), &fp)
+        .await
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "wiki B has no own vectors — a wiki-scoped vector_search must not leak wiki A's vectors"
+    );
+}
+
+/// State (HIGH-4, §4.5.3): `multiQuery: {enabled, n}` must actually fan the
+/// query out and merge by stable `(documentId, nodeId)` identity — it must NOT be
+/// silently ignored. Over a corpus where single-shot recall misses docs that
+/// query-variant fan-out reaches, the enabled result's distinct-identity set is
+/// a STRICT SUPERSET of the disabled single-shot result.
+/// RED today: `rag_query` parses `multi_query` only for validation and never
+/// fans out, so the enabled and disabled results are identical (not a strict
+/// superset).
+#[tokio::test]
+async fn multi_query_fan_out_is_not_ignored() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "doc").await;
-    update_graph(
-        &store,
-        &doc,
-        vec![content_node(&doc.document_id, "n1", "term")],
-        vec![],
-    )
-    .await;
+    // Three related docs: single-shot recall for "quantum" only reaches d1; a
+    // 3-variant fan-out (e.g. quantum / entanglement / coherence) reaches all.
+    for (t, v) in [
+        ("d1", "quantum entanglement"),
+        ("d2", "entanglement coherence"),
+        ("d3", "coherence physics"),
+    ] {
+        let _ = new_content_doc(&store, &w, t, &format!("n-{t}"), v).await;
+    }
     store.set_engine_state(gnosis::EngineState::Ready);
+    let ids = |res: &RagResult| -> std::collections::HashSet<(DocumentId, NodeId)> {
+        res.results
+            .iter()
+            .map(|r| (r.document_id.clone(), r.node_id.clone()))
+            .collect()
+    };
 
-    let res = store
+    let base = store
         .rag_query(
-            "term",
+            "quantum",
+            &RagQueryOptions {
+                wiki_id: Some(w.clone()),
+                top_k: Some(10),
+                mode: Some(QueryMode::Hybrid),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let fan = store
+        .rag_query(
+            "quantum",
             &RagQueryOptions {
                 wiki_id: Some(w),
                 top_k: Some(10),
@@ -503,37 +739,56 @@ async fn multi_query_merges_variants_by_stable_node_identity() {
         )
         .await
         .unwrap();
-    // Merged by stable node identity: each (documentId, nodeId) appears at most once.
-    let mut seen = std::collections::HashSet::new();
-    for r in &res.results {
-        let key = (r.document_id.clone(), r.node_id.clone());
-        assert!(
-            seen.insert(key),
-            "no duplicate node identity after multi-query merge"
-        );
-    }
+    let base_ids = ids(&base);
+    let fan_ids = ids(&fan);
+    assert!(
+        base_ids.is_subset(&fan_ids) && base_ids.len() < fan_ids.len(),
+        "multi-query fan-out must merge N variant results into a strictly larger \
+         distinct-identity set than the single-shot query (it is currently ignored)"
+    );
 }
 
-/// State: compression `filter` mode keeps relevant context (and is not itself a
-/// failure; a compressor failure degrades gracefully to uncompressed context).
+/// State (HIGH-4, §4.5.3): compression `filter` mode is a **post-retrieval
+/// binary keep/drop** — it must change the returned snippet set vs the
+/// uncompressed result. It is currently silently ignored.
+/// RED today: `rag_query` parses `compression` but never applies it, so the
+/// Filter result is byte-for-byte identical to the None result.
 #[tokio::test]
-async fn compression_filter_mode_is_not_a_query_failure() {
+async fn compression_filter_changes_the_snippet_set() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "doc").await;
-    update_graph(
+    // d1: a tight, on-topic snippet. d2: a low-relevance context whose query
+    // token is diluted by filler — a query-aware binary filter keeps d1 and
+    // drops/compresses d2, so the snippet set differs from uncompressed.
+    let _ = new_content_doc(&store, &w, "d1", "n1", "term").await;
+    let _ = new_content_doc(
         &store,
-        &doc,
-        vec![content_node(&doc.document_id, "n1", "contextual term")],
-        vec![],
+        &w,
+        "d2",
+        "n2",
+        "term diluted by a very long run of irrelevant filler words that a query-aware filter should drop",
     )
     .await;
     store.set_engine_state(gnosis::EngineState::Ready);
+    let snips = |res: &RagResult| -> Vec<String> {
+        res.results.iter().map(|r| r.snippet.clone()).collect()
+    };
 
-    // On compressor failure (graceful degrade) the query still succeeds.
-    let res = store
+    let none = store
         .rag_query(
-            "contextual",
+            "term",
+            &RagQueryOptions {
+                wiki_id: Some(w.clone()),
+                top_k: Some(5),
+                compression: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let filtered = store
+        .rag_query(
+            "term",
             &RagQueryOptions {
                 wiki_id: Some(w),
                 top_k: Some(5),
@@ -543,7 +798,11 @@ async fn compression_filter_mode_is_not_a_query_failure() {
         )
         .await
         .unwrap();
-    assert!(!res.results.is_empty());
+    assert_ne!(
+        snips(&none),
+        snips(&filtered),
+        "filter compression must change the returned snippet set (it is currently ignored)"
+    );
 }
 
 /// State: compression `extract` mode (fact-value extraction) is Phase 2.
@@ -584,28 +843,76 @@ async fn compression_graph_mode_runs() {
         .await;
 }
 
-/// State: HyDE is opt-in (`hyde: true`); a `vector`/`hybrid` query with HyDE
-/// generates a hypothetical doc and routes its embedding through the vector leg.
+/// State (HIGH-4, §4.5.3, de-vacuated LOW-F): HyDE is opt-in (`hyde: true`); a
+/// `vector` query with HyDE embeds the **hypothetical** text and routes it
+/// through the vector leg. Using a *text-sensitive* provider, this only passes
+/// when the hypothetical text actually reached `embed` (an `embed` of the raw
+/// query, or any constant-vector mock, would NOT surface the seeded hit).
+///
+/// GREEN today: the engine routes the hypothetical through `embed` under
+/// `hyde: true` (§4.5.3 vector leg). A `hyde: false` comparison shows plain
+/// vector mode does NOT return the hypothetical-seeded hit.
 #[tokio::test]
 async fn hyde_opt_in_routes_hypothetical_through_vector_leg() {
+    use gnosis::RagResultItem;
+
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "doc").await;
-    update_graph(
-        &store,
-        &doc,
-        vec![content_node(&doc.document_id, "n1", "hypothetical")],
-        vec![],
-    )
-    .await;
+    // The doc whose `full` vector equals the *hypothetical* vector — reachable
+    // ONLY if the hypothetical text is embedded. (Its content does not contain
+    // the query term, so plain lexical recall cannot reach it.)
+    let (hypo_doc, hypo_node) = new_content_doc(&store, &w, "d-hypo", "n1", "unrelated-one").await;
+    // Three docs whose `full` vector matches the *plain query* vector: under
+    // `hyde:false` they fill top_k with cosine ~1, pushing the hypothetical doc
+    // (cosine 0 vs the query vector) off the top-k.
+    let (o1, a1) = new_content_doc(&store, &w, "d-o1", "a1", "unrelated-1").await;
+    let (o2, b1) = new_content_doc(&store, &w, "d-o2", "b1", "unrelated-2").await;
+    let (o3, c1) = new_content_doc(&store, &w, "d-o3", "c1", "unrelated-3").await;
+
+    let mut vi = VectorIndex::default();
+    vi.entries.insert(
+        (hypo_doc.clone(), hypo_node.clone(), FieldType::Full),
+        vec![1.0, 0.0],
+    );
+    vi.entries
+        .insert((o1.clone(), a1.clone(), FieldType::Full), vec![0.0, 1.0]);
+    vi.entries
+        .insert((o2.clone(), b1.clone(), FieldType::Full), vec![0.0, 1.0]);
+    vi.entries
+        .insert((o3.clone(), c1.clone(), FieldType::Full), vec![0.0, 1.0]);
+    store.swap_snapshot(DerivedIndexes {
+        lexical: None,
+        vectors: Some(vi),
+        epoch: 1,
+    });
+
+    // Prove the provider is text-sensitive (different text → different vector);
+    // otherwise the `hyde:false` exclusion below would be vacuous.
+    let probe = HydeSensitiveProvider;
+    assert_eq!(
+        probe.embed("hypothetical").await.unwrap(),
+        vec![0.0, 1.0],
+        "the probe must map the plain query text to its distinct vector"
+    );
+    assert_eq!(
+        probe.embed("hypothetical relevant passage").await.unwrap(),
+        vec![1.0, 0.0],
+        "the probe must map the HyDE hypothetical text to its distinct vector"
+    );
+
+    store.set_embedding_provider(Arc::new(HydeSensitiveProvider));
     store.set_engine_state(gnosis::EngineState::Ready);
 
-    let res = store
+    let on_hypo = |r: &RagResultItem| r.document_id == hypo_doc && r.node_id == hypo_node;
+
+    // `hyde: true` → the hypothetical text ("hypothetical relevant passage")
+    // reaches `embed`, producing the hypothetical vector → the seeded hit.
+    let hyde = store
         .rag_query(
             "hypothetical",
             &RagQueryOptions {
-                wiki_id: Some(w),
-                top_k: Some(5),
+                wiki_id: Some(w.clone()),
+                top_k: Some(3),
                 mode: Some(QueryMode::Vector),
                 hyde: Some(true),
                 ..Default::default()
@@ -613,7 +920,33 @@ async fn hyde_opt_in_routes_hypothetical_through_vector_leg() {
         )
         .await
         .unwrap();
-    assert!(!res.results.is_empty());
+    assert!(
+        hyde.results.iter().any(on_hypo),
+        "HyDE must embed the hypothetical text and route it through the vector leg \
+         (the hypothetical-seeded hit is absent — hyde/vector is not routing the hypothetical)"
+    );
+
+    // `hyde: false` (plain vector mode) → embeds the raw query text → the
+    // hypothetical-seeded hit (cosine 0 vs the query vector) is NOT returned.
+    let plain = store
+        .rag_query(
+            "hypothetical",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                top_k: Some(3),
+                mode: Some(QueryMode::Vector),
+                hyde: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !plain.results.iter().any(on_hypo),
+        "plain vector mode (hyde:false) must NOT return the hypothetical-seeded hit — \
+         a constant-vector mock (or an ignored hyde flag) would make hyde:true and \
+         hyde:false indistinguishable"
+    );
 }
 
 /// State (§4.5.2 filters): a filter restricts which nodes/edges retrieval

@@ -1611,6 +1611,31 @@ pub struct Store {
     /// §4.5.3 — the embedding cache (shared across the vector legs).
     #[allow(dead_code)] // wired by the §4.5 Implementer with `vector_search`.
     embedding_cache: RwLock<EmbeddingCache>,
+    /// §4.5.3 — the **query-surface embedding-provider seam** (a STUB). The
+    /// `ragQuery` vector/hybrid/hyde legs (§4.6.1) consult this provider to run
+    /// the dense leg from the query surface (HIGH-1 / HIGH-3, `docs/specs/
+    /// gnosis.md` §4.5.3/§4.6.1). Injected via `set_embedding_provider`.
+    /// Today this is only a **host** — it stores the provider but the §4.5
+    /// Implementer wires it (reads it) inside `vector_query`/`hybrid_query`/
+    /// HyDE routing; no retrieval logic lives here. The `EmbeddingProviderSlot`
+    /// newtype keeps the `#[derive(Debug)]` on `Store` (the trait object itself
+    /// is not `Debug`; the slot prints as an opaque `<injected>` marker).
+    #[allow(dead_code)] // stub seam — read by the §4.5 Implementer's vector wire.
+    embedding_provider: EmbeddingProviderSlot,
+}
+
+/// Stub seam slot so `Store`'s `#[derive(Debug)]` stays intact while carrying
+/// `Option<Arc<dyn EmbeddingProvider>>` (a non-`Debug` trait object). Debug
+/// prints an opaque marker — the provider itself is never formatted.
+#[derive(Default)]
+struct EmbeddingProviderSlot(RwLock<Option<Arc<dyn EmbeddingProvider>>>);
+
+impl std::fmt::Debug for EmbeddingProviderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingProviderSlot")
+            .field("provider", &"<injected>")
+            .finish()
+    }
 }
 
 /// A triple's property payload (§4.2.7.2). The structural `Relation` edge is what
@@ -1661,6 +1686,10 @@ impl Store {
             }),
             query_audit_log: RwLock::new(Vec::new()),
             embedding_cache: RwLock::new(EmbeddingCache::default()),
+            // §4.5.3 — fresh store has no query-surface provider wired; the
+            // §4.5 boot/Implementer injects one to run the dense leg from
+            // `ragQuery` (the vector/hybrid/hyde legs read this seam).
+            embedding_provider: EmbeddingProviderSlot::default(),
         }
     }
 
@@ -1801,6 +1830,25 @@ impl Store {
     /// `getEngineStatus`.
     pub fn set_subsystems(&self, subsystems: EngineSubsystems) {
         *self.subsystems.write().unwrap() = subsystems;
+    }
+
+    /// §4.5.3 / §4.6.1 — **query-surface embedding-provider seam** (STUB): inject
+    /// the embedding provider the `ragQuery` vector/hybrid/hyde legs (§4.6.1)
+    /// should consult to run the dense leg from the query surface. A test/boot
+    /// seam that only **stores** the provider — the §4.5 Implementer reads it
+    /// inside `vector_query`/`hybrid_query`/HyDE routing; no retrieval logic
+    /// lives here (HIGH-1 / HIGH-3, `docs/specs/gnosis.md` §4.6.1 FS-13/FS-14).
+    #[allow(dead_code)] // stub seam — read by the §4.5 Implementer's vector wire.
+    pub fn set_embedding_provider(&self, provider: Arc<dyn EmbeddingProvider>) {
+        *self.embedding_provider.0.write().unwrap() = Some(provider);
+    }
+
+    /// §4.5.3 / §4.6.1 — the currently injected query-surface embedding
+    /// provider (`None` when none is wired). Consumed by the §4.5 Implementer's
+    /// vector/hybrid/hyde legs from the `ragQuery` surface.
+    #[allow(dead_code)] // stub seam — read by the §4.5 Implementer's vector wire.
+    pub fn embedding_provider(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        self.embedding_provider.0.read().unwrap().clone()
     }
 
     /// §4.3.4 — append a query audit entry (engine-side recording). `rag_query`
@@ -3975,26 +4023,78 @@ impl RagStore for Store {
         }
         let top_k = options.top_k.unwrap_or(10) as usize;
         let max_hops = options.max_hops.unwrap_or(3);
-        let (results, trace, citations, blocked_by) = match mode {
-            QueryMode::Flat => self.flat_query(query, top_k, options)?,
-            QueryMode::Vector => self.vector_query(query, top_k, options)?,
-            QueryMode::Hybrid => self.hybrid_query(query, top_k, options)?,
-            QueryMode::Graph => {
-                let (res, steps, cites, blocked) = self.graph_query(
-                    options.wiki_id.as_ref(),
-                    max_hops,
-                    options.filters.as_ref(),
-                    top_k,
-                )?;
-                (res, RagTrace::Graph(steps), cites, blocked)
+
+        // §4.5.3 multi-query fan-out (HIGH-4): when `multiQuery: {enabled, n}` is
+        // on, deterministically expand the query into `n` variants and run the
+        // chosen mode for each, merging results by stable `(documentId, nodeId)`
+        // identity (first-seen order). An expansion failure → `MultiQueryExpansionFailed`.
+        let fan: bool = options.multi_query.map(|m| m.enabled).unwrap_or(false);
+        let variants: Vec<String> = if fan {
+            let n = options.multi_query.unwrap().n;
+            self.expand_query_variants(query, n, options)?
+        } else {
+            vec![query.to_string()]
+        };
+
+        let mut merged_results: Vec<RagResultItem> = Vec::new();
+        let mut merged_citations: Vec<(DocumentId, NodeId)> = Vec::new();
+        let mut seen: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        let mut seen_cit: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        let mut trace: Option<RagTrace> = None;
+        let mut blocked_any: Vec<BlockedBy> = Vec::new();
+        for vq in &variants {
+            let (res, tr, cites, blocked) = match mode {
+                QueryMode::Flat => self.flat_query(vq, top_k, options)?,
+                QueryMode::Vector => self.vector_query(vq, top_k, options).await?,
+                QueryMode::Hybrid => self.hybrid_query(vq, top_k, options).await?,
+                QueryMode::Graph => {
+                    let (r, steps, c, b) = self.graph_query(
+                        options.wiki_id.as_ref(),
+                        max_hops,
+                        options.filters.as_ref(),
+                        top_k,
+                    )?;
+                    (r, RagTrace::Graph(steps), c, b)
+                }
+            };
+            if trace.is_none() {
+                trace = Some(tr);
             }
+            for r in res {
+                if seen.insert((r.document_id.clone(), r.node_id.clone())) {
+                    merged_results.push(r);
+                }
+            }
+            for c in cites {
+                if seen_cit.insert(c.clone()) {
+                    merged_citations.push(c);
+                }
+            }
+            if let Some(b) = blocked {
+                blocked_any.extend(b);
+            }
+        }
+        let trace = trace.expect("every mode produces a trace");
+
+        // §4.5.3 compression (HIGH-4): post-process the retrieved snippets. The
+        // compressor degrades gracefully to uncompressed context on its own
+        // failure (NOT a query failure) — `filter` changes the returned snippet
+        // set, `extract`/`graph` run the higher-phase transforms.
+        let compression = options.compression.unwrap_or(CompressionMode::None);
+        let results = self.apply_compression(merged_results, query, compression);
+        let blocked_by = if results.is_empty() && !blocked_any.is_empty() {
+            Some(blocked_any)
+        } else {
+            None
         };
         let results = self.apply_expand(results, options);
         let result = RagResult {
             query: query.to_string(),
             results,
             engine: "gnosis".to_string(),
-            citations,
+            citations: merged_citations,
             trace,
             blocked_by,
         };
@@ -4093,7 +4193,7 @@ impl RagStore for Store {
 
     async fn vector_search(
         &self,
-        _wiki_id: &WikiId,
+        wiki_id: &WikiId,
         query: &str,
         top_k: u64,
         provider: &dyn EmbeddingProvider,
@@ -4114,50 +4214,7 @@ impl RagStore for Store {
             None => return Err(StoreError::VectorIndexUnavailable),
         };
         let qvec = self.embed_text(query, provider).await?;
-        // Collect distinct nodes carrying a `full` field.
-        let mut nodes: Vec<(DocumentId, NodeId)> = Vec::new();
-        let mut seen: std::collections::HashSet<(DocumentId, NodeId)> =
-            std::collections::HashSet::new();
-        for key in index.entries.keys() {
-            if matches!(key.2, FieldType::Full) && seen.insert((key.0.clone(), key.1.clone())) {
-                nodes.push((key.0.clone(), key.1.clone()));
-            }
-        }
-        // §4.5.3a.3 coarse-to-fine — narrow via the `binary` field, then full cosine.
-        let binary_built = index
-            .entries
-            .keys()
-            .any(|k| matches!(k.2, FieldType::Binary));
-        let pool = if first_pass.binary_first_pass && binary_built {
-            self.binary_candidate_pool(&index, &qvec, &nodes, first_pass.binary_candidate_pool)
-        } else {
-            nodes
-        };
-        let mut scored: Vec<((DocumentId, NodeId), f64)> = Vec::new();
-        for (d, n) in &pool {
-            if let Some(v) = index.entries.get(&(d.clone(), n.clone(), FieldType::Full)) {
-                scored.push(((d.clone(), n.clone()), cosine(&qvec, v)));
-            }
-        }
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0 .0.cmp(&b.0 .0))
-                .then_with(|| a.0 .1.cmp(&b.0 .1))
-        });
-        scored.truncate(top_k as usize);
-        Ok(scored
-            .into_iter()
-            .map(|((d, n), score)| RagResultItem {
-                document_id: d.clone(),
-                node_id: n.clone(),
-                score,
-                snippet: self.node_snippet(&d, &n),
-                source: Source::Local,
-                parent: None,
-                stale: None,
-            })
-            .collect())
+        Ok(self.vector_leg(&index, Some(wiki_id), &qvec, top_k as usize, first_pass))
     }
 }
 
@@ -4261,12 +4318,19 @@ impl Store {
         Ok((results, trace, Vec::new(), None))
     }
 
-    /// §4.5.1 `vector` mode — dense leg. When the query surface has no
-    /// embedding-provider seam wired (no default provider on the store), the
-    /// leg degrades to the lexical fallback (a valid, non-error empty/small
-    /// result). The real vector leg (provider-injected) lives on `vector_search`.
+    /// §4.5.1 `vector` mode — the REAL dense leg driven from the `ragQuery` query
+    /// surface (HIGH-1 / HIGH-3). Embeds the query via the injected
+    /// embedding-provider seam (`set_embedding_provider`), cosine-similarity over
+    /// the wiki-scoped `full`-field vector snapshot, and returns the vector-leg
+    /// hits. Fail-states are genuinely reachable from `ragQuery`:
+    /// `VectorIndexUnavailable` (index not built, FS-14), `EmbeddingUnavailable`
+    /// (provider unreachable, FS-13). With `hyde: true` the hypothetical snippet
+    /// is embedded and routed through the vector leg instead of the raw query
+    /// text; `generate_hypothetical` is total (LOW-E), so `HyDEGenerationFailed`
+    /// is a reserved variant — a provider embed failure here is an
+    /// `EmbeddingUnavailable`, not a relabelled generation failure.
     #[allow(clippy::type_complexity)]
-    fn vector_query(
+    async fn vector_query(
         &self,
         query: &str,
         top_k: usize,
@@ -4280,12 +4344,35 @@ impl Store {
         ),
         StoreError,
     > {
-        let results = self.lexical_rank(
-            options.wiki_id.as_ref(),
-            query,
-            top_k,
-            options.filters.as_ref(),
-        );
+        let index = match self.snapshot().vectors.as_ref() {
+            Some(v) => v.clone(),
+            None => return Err(StoreError::VectorIndexUnavailable),
+        };
+        let provider = self
+            .embedding_provider()
+            .ok_or(StoreError::EmbeddingUnavailable)?;
+        let fp = FirstPassOptions {
+            binary_first_pass: options.binary_first_pass.unwrap_or(false),
+            // LOW-G (§4.5.3a.3): default `binaryCandidatePool` is 10× topK when
+            // omitted (not `0`, which would be the uncapped sentinel).
+            binary_candidate_pool: options.binary_candidate_pool.unwrap_or(10 * top_k as u64),
+        };
+        // HyDE routing: embed the hypothetical relevant snippet and run the
+        // vector leg against it (a generation failure is a hard HyDE fail-state).
+        let hyde = options.hyde.unwrap_or(false);
+        let qvec = if hyde {
+            let hypot = self.generate_hypothetical(query);
+            // LOW-E (§4.5.3): `HyDEGenerationFailed` names the *generation*
+            // step, not the embedding step. `generate_hypothetical` is total
+            // (a deterministic stand-in) so it never constructs the variant;
+            // an embedding-provider failure while embedding the hypothetical is
+            // an `EmbeddingUnavailable`, NOT a `HyDEGenerationFailed` — surface
+            // the provider error honestly instead of relabelling it.
+            self.embed_text(&hypot, provider.as_ref()).await?
+        } else {
+            self.embed_text(query, provider.as_ref()).await?
+        };
+        let results = self.vector_leg(&index, options.wiki_id.as_ref(), &qvec, top_k, &fp);
         let trace = RagTrace::Vector(TraceDescriptor {
             mode: QueryMode::Vector,
             engine: "gnosis".to_string(),
@@ -4295,9 +4382,14 @@ impl Store {
         Ok((results, trace, Vec::new(), None))
     }
 
-    /// §4.5.1 `hybrid` mode — RRF fusion of the graph + vector + lexical legs.
+    /// §4.5.1 `hybrid` mode — THREE distinct, non-degenerate legs fused by RRF
+    /// (HIGH-2): the graph (`reference`→`fact` walk), the real vector leg
+    /// (provider + wiki-scoped `full` index), and the lexical BM25 leg. A
+    /// missing vector index or unwired/unreachable provider degrades the vector
+    /// leg to empty (not a query failure, per the red `multi_query` expectation)
+    /// — never a collapse onto the lexical list.
     #[allow(clippy::type_complexity)]
-    fn hybrid_query(
+    async fn hybrid_query(
         &self,
         query: &str,
         top_k: usize,
@@ -4311,30 +4403,81 @@ impl Store {
         ),
         StoreError,
     > {
-        let lex = self.lexical_rank(
+        let max_hops = options.max_hops.unwrap_or(3);
+        // GRAPH leg — the resolved `reference`→`fact` roots (+ facts they cite),
+        // wiki-scoped and filter-respecting. Blocked/errored roots just don't
+        // contribute (a hybrid merges legs, it does not fail on one.
+        let graph_vals = self.hybrid_graph_leg(
+            options.wiki_id.as_ref(),
+            max_hops,
+            options.filters.as_ref(),
+            top_k,
+        );
+
+        // LEXICAL leg.
+        let lex_vals = self.lexical_rank(
             options.wiki_id.as_ref(),
             query,
             top_k,
             options.filters.as_ref(),
         );
-        // Graph leg: the query surface has no reference→fact walk by default; in
-        // a store with graph content the lexical list still dominates the small
-        // graph. Vector leg degrades to the lexical fallback (no provider seam on
-        // the query surface), matching the mode-trace tests.
-        let graph_ids: Vec<(DocumentId, NodeId)> = Vec::new();
-        let vector_ids: Vec<(DocumentId, NodeId)> = lex
+
+        // VECTOR leg — the real dense leg, degrading to empty when the index is
+        // not built or no provider is wired (HIGH-2). A provider embed failure in
+        // hybrid also degrades the leg to empty (hybrid is resilient).
+        let mut vec_vals: Vec<RagResultItem> = Vec::new();
+        if let Some(index) = self.snapshot().vectors.as_ref().cloned() {
+            if let Some(provider) = self.embedding_provider() {
+                let fp = FirstPassOptions {
+                    binary_first_pass: options.binary_first_pass.unwrap_or(false),
+                    // LOW-G (§4.5.3a.3): default `binaryCandidatePool` is 10×
+                    // topK when omitted (not `0`, the uncapped sentinel).
+                    binary_candidate_pool: options
+                        .binary_candidate_pool
+                        .unwrap_or(10 * top_k as u64),
+                };
+                let hyde = options.hyde.unwrap_or(false);
+                let embedded = if hyde {
+                    let hypot = self.generate_hypothetical(query);
+                    self.embed_text(&hypot, provider.as_ref()).await
+                } else {
+                    self.embed_text(query, provider.as_ref()).await
+                };
+                if let Ok(qvec) = embedded {
+                    vec_vals = self.vector_leg(&index, options.wiki_id.as_ref(), &qvec, top_k, &fp);
+                }
+            }
+        }
+
+        let graph_ids: Vec<(DocumentId, NodeId)> = graph_vals
+            .0
             .iter()
             .map(|r| (r.document_id.clone(), r.node_id.clone()))
             .collect();
-        let lexical_ids = vector_ids.clone();
-        let merged = rrf_fuse(&[graph_ids, vector_ids, lexical_ids], top_k);
-        let lex_map: std::collections::HashMap<(DocumentId, NodeId), RagResultItem> = lex
-            .into_iter()
-            .map(|r| ((r.document_id.clone(), r.node_id.clone()), r))
+        let vector_ids: Vec<(DocumentId, NodeId)> = vec_vals
+            .iter()
+            .map(|r| (r.document_id.clone(), r.node_id.clone()))
             .collect();
+        let lexical_ids: Vec<(DocumentId, NodeId)> = lex_vals
+            .iter()
+            .map(|r| (r.document_id.clone(), r.node_id.clone()))
+            .collect();
+        let merged = rrf_fuse(&[graph_ids, vector_ids, lexical_ids], top_k);
+        let mut item_map: std::collections::HashMap<(DocumentId, NodeId), RagResultItem> =
+            std::collections::HashMap::new();
+        for it in graph_vals
+            .0
+            .iter()
+            .chain(vec_vals.iter())
+            .chain(lex_vals.iter())
+        {
+            item_map
+                .entry((it.document_id.clone(), it.node_id.clone()))
+                .or_insert_with(|| it.clone());
+        }
         let results = merged
             .into_iter()
-            .filter_map(|id| lex_map.get(&id).cloned())
+            .filter_map(|id| item_map.get(&id).cloned())
             .collect();
         let trace = RagTrace::Hybrid(HybridTrace {
             mode: QueryMode::Hybrid,
@@ -4347,7 +4490,7 @@ impl Store {
             top_k: top_k as u64,
             source: Source::Local,
         });
-        Ok((results, trace, Vec::new(), None))
+        Ok((results, trace, graph_vals.1, None))
     }
 
     /// §4.5.2 `graph` mode — a deterministic, hop-limited `reference`→`fact`
@@ -4391,6 +4534,12 @@ impl Store {
                 }
             }
         }
+        // Determinism (MEDIUM-A / §4.5.2): the reference roots are collected
+        // from an unordered HashMap (`docs.values()`), so their order varies per
+        // store instance. Sort the graph-leg walk roots by `(DocumentId, NodeId)`
+        // ascending so the reference-root ordering — and hence the graph-leg
+        // result list — is deterministic BEFORE any top_k truncate or RRF merge.
+        roots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let mut steps: Vec<GraphTraceStep> = Vec::new();
         let mut citations: Vec<(DocumentId, NodeId)> = Vec::new();
         let mut blocked: Vec<BlockedBy> = Vec::new();
@@ -4421,7 +4570,15 @@ impl Store {
         citations.retain(|c| seen_c.insert(c.clone()));
         let mut seen_b = std::collections::HashSet::new();
         blocked.retain(|b| seen_b.insert((b.document_id.clone(), b.node_id.clone())));
+        // Determinism (MEDIUM-A / §4.5.2): resolved roots are ordered by
+        // `(DocumentId, NodeId)` ascending before the top_k truncate, so the
+        // tie-break at the top_k boundary is stable across fresh stores.
+        resolved.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.0 .1.cmp(&b.0 .1)));
         resolved.truncate(top_k);
+        // MEDIUM-10 (§4.5.2): `blockedBy` is only valid on an EMPTY result set.
+        // A walk that resolved at least one root returns results WITHOUT
+        // `blockedBy`; only a fully-blocked (empty) walk carries the block list.
+        let resolved_empty = resolved.is_empty();
         let results = resolved
             .into_iter()
             .map(|((d, n), score)| RagResultItem {
@@ -4434,10 +4591,10 @@ impl Store {
                 stale: None,
             })
             .collect();
-        let blocked_by = if blocked.is_empty() {
-            None
-        } else {
+        let blocked_by = if resolved_empty && !blocked.is_empty() {
             Some(blocked)
+        } else {
+            None
         };
         Ok((results, steps, citations, blocked_by))
     }
@@ -4794,6 +4951,282 @@ impl Store {
                 .any(|d| d.wiki_id == *wiki_id)
         })
     }
+
+    /// MEDIUM-5 — resolve the owning wiki of a document id (for wiki-scoping the
+    /// vector leg), or `None` when the document does not exist in the store.
+    fn document_wiki_id(&self, doc: &DocumentId) -> Option<WikiId> {
+        self.shard_for(doc)
+            .read()
+            .unwrap()
+            .docs
+            .get(doc)
+            .map(|d| d.wiki_id.clone())
+    }
+
+    /// §4.5.3 / §4.5.3a — the shared vector leg: cosine-similarity over the
+    /// `full` field of the immutable vector snapshot, MEDIUM-5 wiki-scoped to the
+    /// queried wiki (a vector hosted under a doc in wiki A is never returned for
+    /// a wiki-B query). Coarse-to-fine `binaryFirstPass` degrades to the `full`
+    /// search when the `binary` field is not built.
+    fn vector_leg(
+        &self,
+        index: &VectorIndex,
+        wiki: Option<&WikiId>,
+        qvec: &[f32],
+        top_k: usize,
+        fp: &FirstPassOptions,
+    ) -> Vec<RagResultItem> {
+        let mut nodes: Vec<(DocumentId, NodeId)> = Vec::new();
+        let mut seen: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        for key in index.entries.keys() {
+            if !matches!(key.2, FieldType::Full) || !seen.insert((key.0.clone(), key.1.clone())) {
+                continue;
+            }
+            if let Some(w) = wiki {
+                if self.document_wiki_id(&key.0).as_ref() != Some(w) {
+                    continue;
+                }
+            }
+            nodes.push((key.0.clone(), key.1.clone()));
+        }
+        let binary_built = index
+            .entries
+            .keys()
+            .any(|k| matches!(k.2, FieldType::Binary));
+        let pool = if fp.binary_first_pass && binary_built {
+            self.binary_candidate_pool(index, qvec, &nodes, fp.binary_candidate_pool)
+        } else {
+            nodes
+        };
+        let mut scored: Vec<((DocumentId, NodeId), f64)> = Vec::new();
+        for (d, n) in &pool {
+            if let Some(v) = index.entries.get(&(d.clone(), n.clone(), FieldType::Full)) {
+                scored.push(((d.clone(), n.clone()), cosine(qvec, v)));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0 .1.cmp(&b.0 .1))
+        });
+        scored.truncate(top_k);
+        scored
+            .into_iter()
+            .map(|((d, n), score)| {
+                let snippet = self.node_snippet(&d, &n);
+                RagResultItem {
+                    document_id: d,
+                    node_id: n,
+                    score,
+                    snippet,
+                    source: Source::Local,
+                    parent: None,
+                    stale: None,
+                }
+            })
+            .collect()
+    }
+
+    /// §4.5.3 — the HyDE hypothetical relevant snippet (a deterministic stand-in
+    /// for the generation leg; the provider embeds it and routes it through the
+    /// vector leg).
+    fn generate_hypothetical(&self, query: &str) -> String {
+        format!("{query} relevant passage")
+    }
+
+    /// §4.5.1 `hybrid` graph leg — the resolved `reference`→`fact` walk roots
+    /// (wiki-scoped, filter-respecting). Roots that are blocked, cyclic, or
+    /// over the hop cap contribute nothing (hybrid degrades a failing leg).
+    /// Returns `(result_items, cited_fact_ids)`.
+    #[allow(clippy::type_complexity)]
+    fn hybrid_graph_leg(
+        &self,
+        wiki: Option<&WikiId>,
+        max_hops: u64,
+        filters: Option<&QueryAuditFilters>,
+        top_k: usize,
+    ) -> (Vec<RagResultItem>, Vec<(DocumentId, NodeId)>) {
+        let mut roots: Vec<(DocumentId, NodeId)> = Vec::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            for doc in guard.docs.values() {
+                if let Some(w) = wiki {
+                    if &doc.wiki_id != w {
+                        continue;
+                    }
+                }
+                for node in &doc.graph.nodes {
+                    if node.kind != NodeKind::Reference
+                        || !self.node_matches_filters(node, doc, filters)
+                    {
+                        continue;
+                    }
+                    roots.push((doc.document_id.clone(), node.node_id.clone()));
+                }
+            }
+        }
+        // Determinism (MEDIUM-A / §4.5.2): the reference roots above are
+        // collected from an unordered HashMap — sort by `(DocumentId, NodeId)`
+        // ascending so the graph-leg order (and the RRF rank at the top_k
+        // boundary) is deterministic before the truncate / RRF merge.
+        roots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut items: Vec<RagResultItem> = Vec::new();
+        let mut cite_set: std::collections::HashSet<(DocumentId, NodeId)> =
+            std::collections::HashSet::new();
+        for root in &roots {
+            let mut path: Vec<(DocumentId, NodeId)> = Vec::new();
+            let mut step_buf: Vec<GraphTraceStep> = Vec::new();
+            let mut cite_buf: Vec<(DocumentId, NodeId)> = Vec::new();
+            let mut block_buf: Vec<BlockedBy> = Vec::new();
+            let ok = self.graph_walk(
+                root,
+                max_hops,
+                0,
+                &mut path,
+                &mut step_buf,
+                &mut cite_buf,
+                &mut block_buf,
+            );
+            if matches!(ok, Ok(Some(_))) {
+                let d = root.0.clone();
+                let n = root.1.clone();
+                let snippet = self.node_snippet(&d, &n);
+                items.push(RagResultItem {
+                    document_id: d,
+                    node_id: n,
+                    score: 1.0,
+                    snippet,
+                    source: Source::Local,
+                    parent: None,
+                    stale: None,
+                });
+                cite_set.extend(cite_buf);
+            }
+        }
+        // Determinism (MEDIUM-A / §4.5.2): stable `(DocumentId, NodeId)` sort of
+        // the resolved graph-leg items before the top_k truncate.
+        items.sort_by(|a, b| {
+            a.document_id
+                .cmp(&b.document_id)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        items.truncate(top_k);
+        (items, cite_set.into_iter().collect())
+    }
+
+    /// §4.5.3 multi-query expansion (HIGH-4) — deterministically fan the query
+    /// out into `n` variants (the query + successive document-popularity
+    /// expansion terms), starting from the original query. An expansion with
+    /// nothing to expand from (no indexable terms) → `MultiQueryExpansionFailed`.
+    fn expand_query_variants(
+        &self,
+        query: &str,
+        n: u64,
+        options: &RagQueryOptions,
+    ) -> Result<Vec<String>, StoreError> {
+        let n = n.max(1) as usize;
+        let mut variants = vec![query.to_string()];
+        if n <= 1 {
+            return Ok(variants);
+        }
+        let mut used: std::collections::HashSet<String> = tokenize(query).into_iter().collect();
+        let ranked =
+            self.term_popularity(options.wiki_id.as_ref(), options.filters.as_ref(), &used);
+        let mut current = query.to_string();
+        let mut added = false;
+        for (term, _) in ranked {
+            if variants.len() >= n {
+                break;
+            }
+            current = format!("{} {}", current, term);
+            used.insert(term);
+            variants.push(current.clone());
+            added = true;
+        }
+        // Real multi-query failure path: with n > 1 and no distinct term to fan
+        // out to, the expansion cannot run → `MultiQueryExpansionFailed` (FS-19).
+        if !added {
+            return Err(StoreError::MultiQueryExpansionFailed);
+        }
+        while variants.len() < n {
+            variants.push(current.clone());
+        }
+        Ok(variants)
+    }
+
+    /// §4.5.3 — the deterministically-ranked indexable terms of the (optional)
+    /// wiki's candidate docs (title/tags/node value/factKey), descending by
+    /// frequency (ties alphabetical), excluding `exclude`. Drives multi-query
+    /// expansion (pseudo-relevance feedback).
+    fn term_popularity(
+        &self,
+        wiki: Option<&WikiId>,
+        filters: Option<&QueryAuditFilters>,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Vec<(String, usize)> {
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for shard in self.shards.iter() {
+            let guard = shard.read().unwrap();
+            for doc in guard.docs.values() {
+                if let Some(w) = wiki {
+                    if &doc.wiki_id != w {
+                        continue;
+                    }
+                }
+                let mut text = format!("{} {}", doc.title, doc.tags.join(" "));
+                for node in &doc.graph.nodes {
+                    if !self.node_matches_filters(node, doc, filters) {
+                        continue;
+                    }
+                    if let Some(v) = &node.value {
+                        text.push(' ');
+                        text.push_str(v);
+                    }
+                    if let Some(fk) = &node.fact_key {
+                        text.push(' ');
+                        text.push_str(fk);
+                    }
+                }
+                for t in tokenize(&text) {
+                    if exclude.contains(&t) {
+                        continue;
+                    }
+                    *freq.entry(t).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<(String, usize)> = freq.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked
+    }
+
+    /// §4.5.3 compression (HIGH-4) — post-retrieval snippet transform. `filter`
+    /// is a query-aware binary keep/drop that changes the returned snippet set;
+    /// `extract`/`graph` are the higher-phase transforms (pass-through here). The
+    /// compressor degrades gracefully to the uncompressed context on failure
+    /// (NOT a query failure); `CompressionFailed` is reserved for a total
+    /// failure that cannot degrade.
+    fn apply_compression(
+        &self,
+        results: Vec<RagResultItem>,
+        query: &str,
+        mode: CompressionMode,
+    ) -> Vec<RagResultItem> {
+        match mode {
+            CompressionMode::None => results,
+            CompressionMode::Filter => {
+                let qterms: std::collections::HashSet<String> =
+                    tokenize(query).into_iter().collect();
+                results
+                    .into_iter()
+                    .filter(|r| relevant_snippet(&qterms, &r.snippet))
+                    .collect()
+            }
+            CompressionMode::Extract | CompressionMode::Graph => results,
+        }
+    }
 }
 
 /// §4.5.3 / §4.5.3a — cosine similarity over the shared prefix (handles the
@@ -4824,6 +5257,21 @@ fn tokenize(s: &str) -> Vec<String> {
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect()
+}
+
+/// §4.5.3 — the query-aware binary relevance filter used by compression `filter`:
+/// keep a snippet whose query-term density is at least 25% (a tight, on-topic
+/// snippet); drop a low-relevance, query-token-diluted snippet.
+fn relevant_snippet(qterms: &std::collections::HashSet<String>, snippet: &str) -> bool {
+    if qterms.is_empty() {
+        return true;
+    }
+    let tokens = tokenize(snippet);
+    if tokens.is_empty() {
+        return false;
+    }
+    let hits = tokens.iter().filter(|t| qterms.contains(*t)).count() as f64;
+    hits / tokens.len() as f64 >= 0.25
 }
 
 /// §4.5.3a.1 — sign-binarize a vector to a compact binary code (used for the

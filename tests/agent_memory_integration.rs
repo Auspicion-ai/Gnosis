@@ -225,6 +225,9 @@ async fn get_profile_summary_regenerates_when_facts_change() {
 /// State: the profile is a **derived** document — a fact update is reflected on
 /// the next regeneration (single source of truth, no drift). The facts table is
 /// the owner; `getProfileSummary` is a projection, never a second source.
+///
+/// De-vacuated: the summary TEXT must surface the NEW value after `update_fact`
+/// (not merely that `factCount` is unchanged at 1).
 #[tokio::test]
 async fn profile_surfaces_a_fact_value_change_into_the_summary() {
     let store = Arc::new(Store::new());
@@ -256,6 +259,17 @@ async fn profile_surfaces_a_fact_value_change_into_the_summary() {
         .unwrap();
     let summary: ProfileSummary = store.get_profile_summary(&w).await.unwrap();
     assert_eq!(summary.fact_count, 1);
+    // The derived projection MUST reflect the NEW canonical value (no drift).
+    assert!(
+        summary.summary.contains("AGPL-3.0"),
+        "summary must surface the updated fact value, got: {:?}",
+        summary.summary
+    );
+    assert!(
+        !summary.summary.contains("MIT"),
+        "summary must not drift back to the stale value, got: {:?}",
+        summary.summary
+    );
 }
 
 // ---------------------------------------------------------------------------

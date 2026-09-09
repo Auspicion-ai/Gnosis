@@ -43,16 +43,18 @@
 //!   here (RED via the stub) and flagged in the report for the Implementer to
 //!   wire deterministically (and for the §5.1 transport seam to surface).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Barrier};
 
 use futures::StreamExt;
 use gnosis::{
     rrf_fuse, BlockedBy, CreateDocumentRequest, DerivedIndexes, Document, DocumentId, Edge,
-    EdgeKind, EngineState, EngineSubsystems, ExpandMode, FieldType, Graph, GraphTraceStep,
-    HybridTrace, MultiQueryOptions, Node, NodeId, NodeKind, QueryAuditEntry, QueryAuditFilters,
-    QueryMode, RagChunk, RagQueryOptions, RagResult, RagResultItem, RagStore, RagStream, RagTrace,
-    ReferenceState, Source, Store, StoreError, TraceDescriptor, UpdateDocumentRequest, VectorIndex,
-    WikiId,
+    EdgeKind, EmbeddingProvider, EngineState, EngineSubsystems, ExpandMode, FieldType, Graph,
+    GraphTraceStep, HybridTrace, MultiQueryOptions, Node, NodeId, NodeKind, QueryAuditEntry,
+    QueryAuditFilters, QueryMode, RagChunk, RagQueryOptions, RagResult, RagResultItem, RagStore,
+    RagStream, RagTrace, ReferenceState, Source, Store, StoreError, TraceDescriptor,
+    UpdateDocumentRequest, VectorIndex, WikiId,
 };
 
 // ---------------------------------------------------------------------------
@@ -216,6 +218,67 @@ async fn seed_ref_to_fact(store: &Store, w: &WikiId) -> (DocumentId, NodeId, Doc
 /// default in this suite, mirroring the boot state).
 fn ready(store: &Store) {
     store.set_engine_state(EngineState::Ready);
+}
+
+/// A deterministic query-surface embedding provider (fixed vector; availability
+/// override). Mirrors the §4.5.3 retrieval-stack mock so the `ragQuery` vector/
+/// hybrid/hyde legs' provider seam is exercised from the query surface.
+struct StubProvider {
+    available: bool,
+    emit_error: bool,
+    v: Vec<f32>,
+}
+
+impl StubProvider {
+    fn hit(v: Vec<f32>) -> Self {
+        StubProvider {
+            available: true,
+            emit_error: false,
+            v,
+        }
+    }
+    fn unreachable() -> Self {
+        StubProvider {
+            available: false,
+            emit_error: true,
+            v: Vec::new(),
+        }
+    }
+}
+
+impl EmbeddingProvider for StubProvider {
+    fn embed(
+        &self,
+        _text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, StoreError>> + Send + '_>> {
+        let emit = self.emit_error;
+        let v = self.v.clone();
+        Box::pin(async move {
+            if emit {
+                Err(StoreError::EmbeddingUnavailable)
+            } else {
+                Ok(v)
+            }
+        })
+    }
+    fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let a = self.available;
+        Box::pin(async move { a })
+    }
+}
+
+/// Seed the immutable vector snapshot with `full`-field entries (the read-side
+/// host the §4.5 vector legs consume).
+fn seed_vector_index(store: &Store, entries: Vec<((DocumentId, NodeId), Vec<f32>)>) {
+    let mut vi = VectorIndex::default();
+    for ((d, n), v) in entries {
+        vi.entries.insert((d, n, FieldType::Full), v);
+    }
+    store.swap_snapshot(DerivedIndexes {
+        lexical: None,
+        vectors: Some(vi),
+        epoch: 1,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -445,21 +508,93 @@ async fn rag_query_flat_mode_returns_top_k_with_flat_trace() {
     }
 }
 
-/// State: `vector` mode returns an `Ok(RagResult)` with a `vector` trace shape
-/// `{mode, engine, topK, source}` (§4.3.3).
+/// State: `vector` mode returns the hits from the **VECTOR** leg (NOT a lexical
+/// fallback). A seeded vector-doc whose content does not lexically match the
+/// query is surfaced only via the provider-injected dense leg (§4.5.3 / HIGH-1).
+///
+/// RED today: `rag_query`'s `vector_query` ignores the injected provider + the
+/// seeded vector index and returns the lexical (empty) list, so the vector-leg
+/// hit below is absent.
 #[tokio::test]
-async fn rag_query_vector_mode_returns_vector_trace() {
+async fn rag_query_vector_mode_returns_vector_leg_hits() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "doc").await;
+    // A doc whose content does NOT contain the query term — plain lexical
+    // retrieval cannot surface it; only the vector leg (via the seeded index +
+    // injected provider) can.
+    let doc = new_doc(&store, &w, "vec-source").await;
     apply_graph(
         &store,
         &doc,
-        wellformed_graph(vec![content_node(&doc.document_id, "n1", "alpha")], vec![]),
+        wellformed_graph(
+            vec![content_node(&doc.document_id, "v1", "unrelated-topic")],
+            vec![],
+        ),
     )
     .await;
+    seed_vector_index(
+        &store,
+        vec![((doc.document_id.clone(), nid("v1")), vec![1.0, 0.0])],
+    );
+    store.set_embedding_provider(Arc::new(StubProvider::hit(vec![1.0, 0.0])));
     ready(&store);
+
     let res = store
+        .rag_query(
+            "gamma",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                top_k: Some(5),
+                mode: Some(QueryMode::Vector),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // trace shape (§4.3.3).
+    match res.trace {
+        RagTrace::Vector(trace) => {
+            assert_eq!(trace.mode, QueryMode::Vector);
+            assert_eq!(trace.engine, "gnosis");
+            assert_eq!(trace.source, Source::Local);
+        }
+        other => panic!("expected vector trace, got {other:?}"),
+    }
+    // The results MUST come from the vector leg: the top vector-leg hit is the
+    // seeded (unrelated, non-lexical) doc — a lexical fallback returns nothing.
+    assert!(
+        res.results
+            .iter()
+            .any(|r| r.document_id == doc.document_id && r.node_id == nid("v1")),
+        "vector-leg hit must be returned from the dense leg"
+    );
+}
+
+/// Fail-state FS-13 reachable from the **`ragQuery` surface**: vector mode with a
+/// real vector index built but an **unreachable embedding provider** →
+/// `EmbeddingUnavailable` (§4.6.1 / HIGH-3). RED today: `rag_query`'s
+/// `vector_query` ignores the provider seam and returns an `Ok` lexical result.
+#[tokio::test]
+async fn rag_query_vector_mode_unavailable_provider_is_embedding_unavailable() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+    // A real doc in the wiki whose vector index IS built — only the provider
+    // being unreachable can fail the query (not the index).
+    let doc = new_doc(&store, &w, "vec-source").await;
+    apply_graph(
+        &store,
+        &doc,
+        wellformed_graph(vec![content_node(&doc.document_id, "v1", "alpha")], vec![]),
+    )
+    .await;
+    seed_vector_index(
+        &store,
+        vec![((doc.document_id.clone(), nid("v1")), vec![1.0, 0.0])],
+    );
+    store.set_embedding_provider(Arc::new(StubProvider::unreachable()));
+    ready(&store);
+
+    let err = store
         .rag_query(
             "alpha",
             &RagQueryOptions {
@@ -470,66 +605,133 @@ async fn rag_query_vector_mode_returns_vector_trace() {
             },
         )
         .await
-        .unwrap();
-    match res.trace {
-        RagTrace::Vector(trace) => {
-            assert_eq!(trace.mode, QueryMode::Vector);
-            assert_eq!(trace.engine, "gnosis");
-            assert_eq!(trace.source, Source::Local);
-        }
-        other => panic!("expected vector trace, got {other:?}"),
-    }
+        .unwrap_err();
+    assert_eq!(err, StoreError::EmbeddingUnavailable);
 }
 
-/// State: `hybrid` mode returns an `Ok(RagResult)` with a `hybrid` trace shape
-/// `{mode, engine, legs: ['graph','vector','lexical'], topK, source}` (§4.3.3).
+/// Fail-state FS-14 reachable from the **`ragQuery` surface**: vector mode when
+/// the vector index is **not built** → `VectorIndexUnavailable` (§4.6.1 / HIGH-3).
+/// RED today: `rag_query`'s `vector_query` never consults the vector index and
+/// returns an `Ok` (possibly empty) lexical result instead of the fail-state.
 #[tokio::test]
-async fn rag_query_hybrid_mode_returns_hybrid_trace_with_three_legs() {
+async fn rag_query_vector_mode_index_not_built_is_vector_index_unavailable() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "doc").await;
+    let doc = new_doc(&store, &w, "vec-source").await;
     apply_graph(
         &store,
         &doc,
-        wellformed_graph(vec![content_node(&doc.document_id, "n1", "alpha")], vec![]),
+        wellformed_graph(vec![content_node(&doc.document_id, "v1", "alpha")], vec![]),
     )
     .await;
+    // No vector index is seeded (snapshot vectors == None).
+    store.set_embedding_provider(Arc::new(StubProvider::hit(vec![1.0, 0.0])));
     ready(&store);
-    let res = store
+
+    let err = store
         .rag_query(
             "alpha",
             &RagQueryOptions {
                 wiki_id: Some(w),
                 top_k: Some(5),
+                mode: Some(QueryMode::Vector),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, StoreError::VectorIndexUnavailable);
+}
+
+/// State: `hybrid` mode merges the graph + vector + lexical legs by RRF, and the
+/// merged result reflects **three distinct non-degenerate legs** (§4.5.3 / HIGH-2).
+/// A lexical hit, a vector-only hit, and a graph-only hit that all differ must
+/// ALL appear — a result that only reflects the lexical list must fail.
+///
+/// RED today: `hybrid_query` collapses the vector leg to the lexical list and
+/// the graph leg to empty, so only the lexical hit appears.
+#[tokio::test]
+async fn rag_query_hybrid_mode_merges_three_distinct_legs() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+
+    // LEXICAL leg hit — content contains the query term.
+    let ldoc = new_doc(&store, &w, "lex-doc").await;
+    apply_graph(
+        &store,
+        &ldoc,
+        wellformed_graph(
+            vec![content_node(&ldoc.document_id, "n-lx", "alpha")],
+            vec![],
+        ),
+    )
+    .await;
+
+    // VECTOR leg hit — content does NOT match the query; only the seeded vector
+    // index + injected provider reach it.
+    let vdoc = new_doc(&store, &w, "vec-doc").await;
+    apply_graph(
+        &store,
+        &vdoc,
+        wellformed_graph(vec![content_node(&vdoc.document_id, "n-vx", "zzz")], vec![]),
+    )
+    .await;
+    seed_vector_index(
+        &store,
+        vec![((vdoc.document_id.clone(), nid("n-vx")), vec![1.0, 0.0])],
+    );
+
+    // GRAPH leg hit — a reference node resolving to a fact (a §4.5.2 walk root).
+    let (_fdoc, _fnid, rdoc, rnid) = seed_ref_to_fact(&store, &w).await;
+
+    store.set_embedding_provider(Arc::new(StubProvider::hit(vec![1.0, 0.0])));
+    ready(&store);
+
+    let res = store
+        .rag_query(
+            "alpha",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                top_k: Some(10),
                 mode: Some(QueryMode::Hybrid),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
+    // trace legs (§4.3.3): ['graph','vector','lexical'].
     match res.trace {
         RagTrace::Hybrid(trace) => {
             assert_eq!(trace.mode, QueryMode::Hybrid);
-            assert_eq!(trace.engine, "gnosis");
-            assert_eq!(
-                trace.legs,
-                vec![
-                    "graph".to_string(),
-                    "vector".to_string(),
-                    "lexical".to_string()
-                ]
-            );
-            assert_eq!(trace.top_k, 5);
+            assert_eq!(trace.legs, vec!["graph", "vector", "lexical"]);
+            assert_eq!(trace.top_k, 10);
         }
         other => panic!("expected hybrid trace, got {other:?}"),
     }
+    // Non-degeneracy: EVERY distinct leg contributed at least one result.
+    assert!(
+        res.results
+            .iter()
+            .any(|r| r.document_id == ldoc.document_id && r.node_id == nid("n-lx")),
+        "lexical leg must contribute"
+    );
+    assert!(
+        res.results
+            .iter()
+            .any(|r| r.document_id == vdoc.document_id && r.node_id == nid("n-vx")),
+        "vector leg must contribute (a distinct, non-degenerate leg)"
+    );
+    assert!(
+        res.results
+            .iter()
+            .any(|r| r.document_id == rdoc && r.node_id == rnid),
+        "graph leg must contribute"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // §4.5.2 Multi-hop traversal (mode:'graph')
-// ---------------------------------------------------------------------------
-
-/// State: `graph` mode resolves through the `reference`→`fact` graph (wrapping
+// ---------------------------------------------------------------------------/// State: `graph` mode resolves through the `reference`→`fact` graph (wrapping
 /// `resolve_references`) and returns the ordered path as the `graph` trace.
 #[tokio::test]
 async fn rag_query_graph_mode_resolves_reference_to_fact() {
@@ -757,6 +959,237 @@ async fn rag_query_graph_mode_empty_result_with_blocked_by() {
         .any(|b: &BlockedBy| b.state == ReferenceState::Broken));
 }
 
+/// State (MEDIUM-7, §4.5.2/§4.4.2 liveness): a reference edge whose
+/// target is **missing** must be derived as blocked by liveness (surfaced as an
+/// empty result with `blockedBy`) — NOT fabricated as `Resolved` and walked into
+/// a missing node (which would error).
+///
+/// Status: **GREEN**. The store already derives reference state from liveness at
+/// ingest — `update_document` stamps a missing-target link as `BROKEN` — so the
+/// `graph_walk` never actually receives a `state: None` edge to a missing target
+/// (its `unwrap_or(Resolved)` fallback is unreachable through the public API).
+/// This is a genuine regression guard: it asserts the required end-to-end
+/// observable behavior (empty result + blockedBy, no phantom walk / no error).
+#[tokio::test]
+async fn rag_query_graph_mode_derives_blocked_from_missing_target() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+    // A reference whose edge carries `state: None` and targets a missing node.
+    let d = new_doc(&store, &w, "dangling").await;
+    let missing = (did("ghost-doc"), nid("ghost"));
+    let rnid = nid("r");
+    apply_graph(
+        &store,
+        &d,
+        wellformed_graph(
+            vec![ref_to(&d.document_id, "r", missing.clone())],
+            vec![edge(
+                EdgeKind::Link,
+                (d.document_id.clone(), rnid.clone()),
+                missing,
+                None, // state: None — state must be derived from liveness
+            )],
+        ),
+    )
+    .await;
+    ready(&store);
+
+    let res = store
+        .rag_query(
+            "x",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                mode: Some(QueryMode::Graph),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a missing target derived from liveness is a valid blocked state, not an error");
+    assert!(
+        res.results.is_empty(),
+        "no target resolved → an empty (blocked) result, not a walk into a phantom"
+    );
+    assert!(res.citations.is_empty());
+    let blocked = res
+        .blocked_by
+        .expect("blockedBy present for the blocked empty result");
+    assert!(
+        blocked
+            .iter()
+            .any(|b: &BlockedBy| b.document_id == d.document_id && b.node_id == rnid),
+        "the liveness-blocked reference is listed in blockedBy"
+    );
+}
+
+/// State (MEDIUM-10, §4.5.2): `blockedBy` is only valid on an **empty** result
+/// set. When some roots resolve and others are blocked, the result must NOT
+/// carry `blockedBy`.
+/// RED today: `graph_query` sets `blockedBy = Some(...)` whenever any root was
+/// blocked, even alongside resolved results.
+#[tokio::test]
+async fn rag_query_graph_mode_blocked_by_only_on_empty_results() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+    // Root #1 resolves (reference → fact); root #2 is BROKEN/blocked.
+    let (_fdoc, _fnid, rdoc, rnid) = seed_ref_to_fact(&store, &w).await;
+    let bdoc = new_doc(&store, &w, "broken").await;
+    let missing = (did("ghost-doc"), nid("ghost"));
+    let bnode = nid("b");
+    apply_graph(
+        &store,
+        &bdoc,
+        wellformed_graph(
+            vec![ref_to(&bdoc.document_id, "b", missing.clone())],
+            vec![edge(
+                EdgeKind::Link,
+                (bdoc.document_id.clone(), bnode.clone()),
+                missing,
+                Some(ReferenceState::Broken),
+            )],
+        ),
+    )
+    .await;
+    ready(&store);
+
+    let res = store
+        .rag_query(
+            "resolve",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                mode: Some(QueryMode::Graph),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        res.results
+            .iter()
+            .any(|r| r.document_id == rdoc && r.node_id == rnid),
+        "the resolvable reference root resolves"
+    );
+    assert!(
+        res.blocked_by.is_none(),
+        "blockedBy is only valid on empty results — a partial/non-empty result must not carry it"
+    );
+}
+
+/// Determinism regression (§4.5.2/§4.5.3 re-audit, MEDIUM-A). `graph_query` and
+/// the hybrid graph leg collect their walk roots by iterating a `HashMap`
+/// (`docs.values()`), which is **not** order-guaranteed. When several
+/// graph roots all resolve (so every root ties at the same relevance), the
+/// ordering (and, at a `top_k` boundary, even the *set*) of the returned hits
+/// must still be deterministic and tie-break by `(documentId, nodeId)`
+/// ascending (§4.5.3 RRF pin; `mode: graph` per §4.5.2 deterministic walk).
+///
+/// State under test: 5 distinct `reference`→`fact` chains, all resolving, with
+/// `top_k = 3` (so the `top_k` truncation happens *between* the 5 tied roots and
+/// the boundary is exercised). We make the assertion in two ways:
+///   (a) **cross-instance determinism** — build the identical corpus across
+///       NUM_STORES independently-created `Store` instances (each fresh
+///       `Store::new()` spins up a NEW HashMap `RandomState`, so each instance
+///       simulates a separate run/process with a different unordered iteration
+///       order). Every instance must return the identical
+///       `(documentId, nodeId)`-ascending top-3 for both `hybrid` and `graph`.
+///       A single instance that reorders (either a wrong SET at the top_k
+///       boundary, or the right set in the wrong order) is the nondeterminism
+///       bug the re-audit flagged.
+///   (b) **within-instance run-to-run stability** — repeat the query 30× on the
+///       first instance and assert every run returns the identical ordering.
+///
+/// The only contributing leg is the graph leg (no vector index seeded, lexical
+/// query term matches nothing), so the returned hits are precisely the graph-leg
+/// roots and the tie-break rule is what a deterministic merge must enforce.
+#[tokio::test]
+async fn graph_hybrid_ordering_is_deterministic() {
+    const CHAINS: usize = 48; // many roots → several reference-root docs share a shard (the unordered-HashMap hazard)
+    const TOP_K: usize = 4; // few relative to CHAINS → the top_k boundary cuts the tie deep inside a shared shard
+    const NUM_STORES: usize = 40; // many fresh RandomState seeds → exercises the unordered HashMap order
+
+    // Seed `CHAINS` distinct resolving `reference`→`fact` chains into `store`.
+    // Each chain's reference root resolves (a Resolved link to a fact), so all
+    // roots tie in the graph leg.
+    async fn seed_chains(store: &Arc<Store>, w: &WikiId) -> Vec<(DocumentId, NodeId)> {
+        let mut roots: Vec<(DocumentId, NodeId)> = Vec::new();
+        for _ in 0..CHAINS {
+            let (_fdoc, _fnid, rdoc, rnid) = seed_ref_to_fact(store, w).await;
+            roots.push((rdoc, rnid));
+        }
+        roots
+    }
+
+    for store_idx in 0..NUM_STORES {
+        let store = Arc::new(Store::new());
+        let w = new_wiki(&store, "w").await;
+        let roots = seed_chains(&store, &w).await;
+        ready(&store);
+
+        // §4.5.3 / §4.5.2 deterministic expectation: ties broken by
+        // `(documentId, nodeId)` ascending, truncated to top_k.
+        let mut expected: Vec<(DocumentId, NodeId)> = roots;
+        expected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        expected.truncate(TOP_K);
+
+        for mode in [QueryMode::Hybrid, QueryMode::Graph] {
+            // (a) cross-instance assertion: THIS store instance must produce the
+            // deterministic ascending order.
+            let res = store
+                .rag_query(
+                    "determinism-check-zz-unmatched",
+                    &RagQueryOptions {
+                        wiki_id: Some(w.clone()),
+                        top_k: Some(TOP_K as u64),
+                        mode: Some(mode),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let order: Vec<(DocumentId, NodeId)> = res
+                .results
+                .iter()
+                .map(|r| (r.document_id.clone(), r.node_id.clone()))
+                .collect();
+            assert_eq!(
+                order, expected,
+                "{mode:?} store #{store_idx}: the result ordering must tie-break by \
+                 (documentId, nodeId) ascending regardless of HashMap insertion order — \
+                 a fresh store instance reordered it (nondeterminism)"
+            );
+
+            // (b) within-instance stability: 30 identical runs must not vary.
+            let mut seen: Option<Vec<(DocumentId, NodeId)>> = None;
+            for _ in 0..30 {
+                let rerun = store
+                    .rag_query(
+                        "determinism-check-zz-unmatched",
+                        &RagQueryOptions {
+                            wiki_id: Some(w.clone()),
+                            top_k: Some(TOP_K as u64),
+                            mode: Some(mode),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let rerun_order: Vec<(DocumentId, NodeId)> = rerun
+                    .results
+                    .iter()
+                    .map(|r| (r.document_id.clone(), r.node_id.clone()))
+                    .collect();
+                match &seen {
+                    Some(prev) => assert_eq!(
+                        &rerun_order, prev,
+                        "{mode:?} store #{store_idx}: the ordering must be identical across \
+                         every run (graph-leg roots are collected from an unordered HashMap)"
+                    ),
+                    None => seen = Some(rerun_order),
+                }
+            }
+        }
+    }
+}
+
 /// State (§4.5.2 `expand: 'parent'`): the top `maxParentContext` results by
 /// score carry a `parent {documentId, title, snippet, stale}`; results beyond
 /// the cap are returned without one.
@@ -800,38 +1233,65 @@ async fn rag_query_expand_parent_caps_expanded_hits_by_max_parent_context() {
 }
 
 /// State (§4.5.2): a `STALE` embed's parent carries `stale: true` so the
-/// generator does not trust stale content.
+/// generator does not trust stale content. Non-vacuous: a reference node with a
+/// REAL `Stale` embed edge (not an edgeless node) is retrieved and a parent is
+/// actually produced carrying `stale: true`.
 #[tokio::test]
 async fn rag_query_stale_embed_parent_carries_stale_flag() {
     let store = Arc::new(Store::new());
     let w = new_wiki(&store, "w").await;
-    let doc = new_doc(&store, &w, "embedded").await;
+    // A reference node with a REAL Stale embed edge to a fact.
+    let fdoc = new_doc(&store, &w, "fact-doc").await;
     apply_graph(
         &store,
-        &doc,
+        &fdoc,
+        wellformed_graph(vec![fact_node(&fdoc.document_id, "F", "v")], vec![]),
+    )
+    .await;
+    let rdoc = new_doc(&store, &w, "stale-embed").await;
+    let target = (fdoc.document_id.clone(), nid("F"));
+    let rnid = nid("R");
+    apply_graph(
+        &store,
+        &rdoc,
         wellformed_graph(
-            vec![content_node(&doc.document_id, "n1", "content")],
-            vec![],
+            vec![ref_to(&rdoc.document_id, "R", target.clone())],
+            vec![edge(
+                EdgeKind::Embed,
+                (rdoc.document_id.clone(), rnid.clone()),
+                target,
+                Some(ReferenceState::Stale),
+            )],
         ),
     )
     .await;
     ready(&store);
-    let opts = RagQueryOptions {
-        wiki_id: Some(w),
-        top_k: Some(5),
-        expand: Some(ExpandMode::Parent),
-        filters: Some(QueryAuditFilters {
-            node_kind: None,
-            edge_type: Some(EdgeKind::Embed),
-            target: None,
-            state: Some(ReferenceState::Stale),
-        }),
-        ..Default::default()
-    };
-    let res = store.rag_query("content", &opts).await.unwrap();
-    // Any expanded parent for a STALE embed must carry stale: true.
-    for r in res.results.iter().filter(|r| r.parent.is_some()) {
-        assert!(r.parent.as_ref().unwrap().stale);
+
+    let res = store
+        .rag_query(
+            "stale-embed",
+            &RagQueryOptions {
+                wiki_id: Some(w),
+                top_k: Some(5),
+                expand: Some(ExpandMode::Parent),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Assert results were actually produced (the ref doc is retrieved by its
+    // title), so this is not a vacuous pass over an empty list.
+    let with_parent: Vec<_> = res.results.iter().filter(|r| r.parent.is_some()).collect();
+    assert!(
+        !with_parent.is_empty(),
+        "a parent must be produced for the retrieved reference"
+    );
+    // Every expanded parent for a STALE embed must carry stale: true (§4.5.2).
+    for r in with_parent {
+        assert!(
+            r.parent.as_ref().unwrap().stale,
+            "STALE embed's parent must carry stale: true"
+        );
     }
 }
 
@@ -1172,36 +1632,77 @@ async fn get_engine_status_unavailable_blocked_for_rag_query() {
 // ---------------------------------------------------------------------------
 
 /// Genuinely-contending `#[tokio::test(flavor = "multi_thread")]` + `Barrier`:
-/// multiple concurrent `ragQuery` reads (against the immutable snapshot, the
-/// read-side) race a concurrent index rebuild (the immutable-snapshot swap).
-/// The read-side is a RED stub, so every reader surfaces the unimplemented
-/// panic — proving the concurrent read path is reachable but not yet green.
+/// multiple concurrent **vector-mode** `ragQuery` reads (the read side) race a
+/// concurrent index rebuild (the immutable-snapshot swap). Each reader must
+/// actually read the immutable vector snapshot and return the seeded vector-leg
+/// hit (a coherent per-reader result) — flat-over-empty reads (the old vacuous
+/// form) return nothing and fail the assertion.
+///
+/// RED today: `rag_query(mode: vector)` ignores the injected provider + seeded
+/// index and returns a lexical (empty) list, so the readers surface no
+/// vector-leg hit (a panic in the reader task → a join error).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_rag_query_reads_race_a_concurrent_index_rebuild() {
     use tokio::sync::Barrier;
 
     let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
     ready(&store);
+    store.set_embedding_provider(Arc::new(StubProvider::hit(vec![1.0, 0.0])));
 
-    // Seed an immutable derived snapshot (the read-side host).
-    let mut v = VectorIndex::default();
-    v.entries
-        .insert((did("d"), nid("n"), FieldType::Full), vec![1.0, 0.0]);
+    // Seed a real doc in the wiki whose content does NOT lexically match the
+    // query, then host its vector in the immutable snapshot (the read-side).
+    let doc = new_doc(&store, &w, "vec-source").await;
+    apply_graph(
+        &store,
+        &doc,
+        wellformed_graph(
+            vec![content_node(&doc.document_id, "v1", "unrelated")],
+            vec![],
+        ),
+    )
+    .await;
+    let mut v0 = VectorIndex::default();
+    v0.entries.insert(
+        (doc.document_id.clone(), nid("v1"), FieldType::Full),
+        vec![1.0, 0.0],
+    );
     store.swap_snapshot(DerivedIndexes {
         lexical: None,
-        vectors: Some(v),
+        vectors: Some(v0),
         epoch: 1,
     });
+    let vkey = (doc.document_id.clone(), nid("v1"), FieldType::Full);
 
     let barrier = Arc::new(Barrier::new(9)); // 8 readers + 1 rebuild writer
     let mut readers = Vec::new();
-    for k in 0..8 {
+    for _ in 0..8 {
         let s = store.clone();
         let b = barrier.clone();
+        let wid = w.clone();
+        let target = vkey.clone();
         readers.push(tokio::spawn(async move {
             b.wait().await;
-            s.rag_query(&format!("concurrent-{k}"), &RagQueryOptions::default())
+            let res = s
+                .rag_query(
+                    "gamma",
+                    &RagQueryOptions {
+                        wiki_id: Some(wid),
+                        top_k: Some(5),
+                        mode: Some(QueryMode::Vector),
+                        ..Default::default()
+                    },
+                )
                 .await
+                .expect("concurrent vector rag_query must return Ok(RagResult)");
+            // The reader MUST have read the immutable vector snapshot and return
+            // the seeded vector-leg hit (a coherent per-reader result).
+            assert!(
+                res.results
+                    .iter()
+                    .any(|r| r.document_id == target.0 && r.node_id == target.1),
+                "reader must return the vector-leg hit from the immutable snapshot"
+            );
         }));
     }
     // The concurrent index rebuild: swap a fresh snapshot on the epoch feed.
@@ -1211,10 +1712,7 @@ async fn concurrent_rag_query_reads_race_a_concurrent_index_rebuild() {
         wb.wait().await;
         for epoch in 1..=10u64 {
             let mut v1 = VectorIndex::default();
-            v1.entries.insert(
-                (did("d"), nid("n"), FieldType::Full),
-                vec![epoch as f32, 0.0],
-            );
+            v1.entries.insert(vkey.clone(), vec![1.0, 0.0]);
             wstore.swap_snapshot(DerivedIndexes {
                 lexical: None,
                 vectors: Some(v1),
@@ -1224,18 +1722,15 @@ async fn concurrent_rag_query_reads_race_a_concurrent_index_rebuild() {
     });
 
     // The 8 readers + 1 rebuild self-synchronize on the barrier, then the
-    // readers issue genuinely-concurrent `ragQuery` reads against the immutable
-    // snapshot while the rebuild swipes the index. Each reader asserts a valid
-    // `Ok(RagResult)` — which is RED today (the query path is a compiling stub
-    // that panics, surfacing as a join error). The rebuild proceeds regardless.
-    for r in readers {
-        let joined = r
-            .await
-            .expect("concurrent reader task must not crash on join");
-        let res: RagResult = joined.expect("concurrent rag_query must return Ok(RagResult)");
-        let _ = res;
-    }
+    // readers issue genuinely-concurrent vector-mode `ragQuery` reads against
+    // the immutable snapshot while the rebuild swipes the index. Both the
+    // rebuild (independent) and the reader joins are collected; a reader that
+    // read no vector-leg hit panics inside its task, surfacing as a join error.
     let _ = rebuild.await;
+    for r in readers {
+        r.await
+            .expect("concurrent reader task must not crash on join");
+    }
 }
 
 /// The immutable-snapshot swap is atomic under concurrent readers: N OS threads

@@ -7,7 +7,12 @@ is fixed here.
 
 ## OPEN
 
-_(none open — the §4.1 host defects below are FIXED; see FIXED.)_
+| Defect / gap | Where it stands | Note |
+| --- | --- | --- |
+| **`subTaskDag` is a validated-only no-op** | `src/store/mod.rs` (option parsed + validated; nothing decomposed) | **DOCUMENTED, NOT IMPLEMENTED** (decision SUB-TASK-DAG-VALIDATED-ONLY). The inference-time sub-task DAG is opto-in / SHOULD-HAVE (like adaptive RAG, which is PARKED). A single-node decomposition (the query itself) is the honest stand-in; **no fake decomposition** is fabricated. `SubTaskDagFailed` is a **RESERVED** variant. Parked in `docs/pending.md`. |
+| **`CompressionFailed` is reserved (no fail-state)** | `src/store/mod.rs` (compressor is total) | The spec says the compressor **degrades gracefully to uncompressed** on failure; the local compressor (Filter/Extract/Graph) only **transforms** and never fails-and-degrades. `CompressionFailed` is a **RESERVED** variant for a future non-degradable compressor leg. The graceful-degrade behavior is **spec-correct**; this is **not** a missing fail-state (decision RESERVED-ERRVARIANTS-DISCIPLINE). |
+| **`HyDEGenerationFailed` reserved; provider errors surface as `EmbeddingUnavailable` (LOW-E)** | `src/store/mod.rs` `vector_query` | `generate_hypothetical` is **total** (a deterministic stand-in), so it never constructs `HyDEGenerationFailed`. The prior code **relabelled** any `embed` provider error as `HyDEGenerationFailed`; fixed (LOW-E) so an embedding-provider failure surfaces as `EmbeddingUnavailable`. `HyDEGenerationFailed` remains **reserved** for the actual hypothetical-**generation** step when it becomes fallible. |
+| **LOW-G test/spec mismatch — `binaryCandidatePool` default 10×topK** | `tests/retrieval_stack_integration.rs` `binary_candidate_pool_none_default_caps_pool_at_tenx_topk` | **OPEN spec/test reconciliation (needs supervisor):** the spec (§4.5.3a.3) says the default `binaryCandidatePool` is **e.g. 10× topK**. The RED test seeds exactly **20** candidates (= 10×topK for its `top_k = 2`) and places the true full-cosine best at ranked position **11** — so a `10 × top_k` default (**20**) **cannot** exclude it (the best sits *inside* the 10×topK boundary). Applying `10 * top_k` empirically leaves the test RED; a fixed cap of `10` (the test's own `DEFAULT_CAP`) greens it. The test's own doc-comment claims it "seeds >10×topK candidates", which is arithmetically inconsistent (20 is not > 20 for topK=2). Engine keeps the **spec-faithful `10 * top_k`** default; this RED cannot be satisfied without amending the test seed (place the best beyond 10×topK, i.e. seed >20 candidates) or relaxing the default semantics. |
 
 ## FIXED
 
