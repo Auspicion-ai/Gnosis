@@ -49,6 +49,21 @@ a human or an LLM host; both are "manual" in the §4.2.8.4 sense (neither is an
 automatic computation *inside* the engine). This preserves the invariant by
 construction: the LLM host is a *caller*, not an engine-internal automatic pass.
 
+## Authorship presentation (forward-looking, decision AUTHORSHIP-SOURCE-PROPERTY)
+
+Each enrichment call the host makes (`declareCommunity`/`updateCommunitySummary`/
+`resolveEntities`/`mergeFacts`) presents an **authorship provenance**
+`{source: LlmHost, authority: LlmHost}` (per-call, like `requester`); the engine
+persists it on the record (`Community.authorship`, a new `entity_authorship` map
+keyed by canonical, `Fact.authorship`). A future **opt-in engine lock**
+(default-OFF) enforces `authority(new) >= authority(prior)` and would reject an
+LLM-host override of a human's higher-authority declaration with
+`InsufficientAuthority` (RESERVED until the lock lands). This **refines — not
+changes** — the §4.2.8.4 invariant: the LLM host is still a manual caller, but a
+lower-authority one. The authority ordering is `System < Agent < LlmHost <
+HumanJunior < HumanSenior`; `source` is the attribution dimension
+(`Human|Agent|LlmHost|System`). See `docs/specs/authorship-source-review.md`.
+
 ## The integration contract (what the harnessed-LLM host does)
 
 A suite tool with a harnessed LLM drives Gnosis's surfaces over the existing
