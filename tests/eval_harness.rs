@@ -544,21 +544,25 @@ fn empty_set_conventions() {
 // ---------------------------------------------------------------------------
 #[test]
 fn k_boundaries() {
-    let r = results(&[("B", "b"), ("A", "a"), ("C", "c"), ("D", "d")]);
+    let r = results(&[("A", "a"), ("B", "b"), ("C", "c"), ("D", "d")]);
     let rel = relevant(&[("B", "b"), ("D", "d")]);
     let len = r.len();
 
-    // k = len → full list evaluated.
+    // k = len → full list evaluated. Spec §6 reference values for
+    // `results=[A,B,C,D]`, `relevant={B,D}`, `k=4`: precision 0.5 (B@rank2 →
+    // precision@2=0.5, D@rank4 → precision@4=0.5, CP=(1/2)(0.5+0.5)=0.5);
+    // recall 1.0 (top_k={A,B,C,D}, |∩|=2, |relevant|=2); nDCG ≈0.6510;
+    // MRR 0.5 (first relevant B@rank2 → 1/2).
     assert_eq!(contextual_precision(&r, &rel, len), 0.5);
-    assert_eq!(contextual_recall(&r, &rel, len), 0.5);
+    assert_eq!(contextual_recall(&r, &rel, len), 1.0);
     assert_close(ndcg_at_k(&r, &rel, len), 0.6510);
-    assert_eq!(mrr_at_k(&r, &rel, len), 1.0);
+    assert_eq!(mrr_at_k(&r, &rel, len), 0.5);
 
     // k > len → effective_top = len; identical to k = len.
     assert_eq!(contextual_precision(&r, &rel, len + 5), 0.5);
-    assert_eq!(contextual_recall(&r, &rel, len + 5), 0.5);
+    assert_eq!(contextual_recall(&r, &rel, len + 5), 1.0);
     assert_close(ndcg_at_k(&r, &rel, len + 5), 0.6510);
-    assert_eq!(mrr_at_k(&r, &rel, len + 5), 1.0);
+    assert_eq!(mrr_at_k(&r, &rel, len + 5), 0.5);
 
     // k = 1 → only the first item considered.
     let r1 = results(&[("A", "a"), ("B", "b")]);
