@@ -3358,6 +3358,11 @@ impl RagStore for Store {
         };
         let mut merged = Vec::new();
         let mut aliases = Vec::new();
+        let mut map = self.entity_resolution.write().unwrap();
+        // RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: the chosen canonical is never
+        // itself an alias — drop any prior entry so the map stays acyclic (kills
+        // reverse-cycles) and the canonical is always a true root.
+        map.remove(&canonical);
         for e in entity_ids {
             if *e == canonical {
                 continue;
@@ -3373,10 +3378,19 @@ impl RagStore for Store {
             // CRITICAL #2 (GRAPH-OWNS-RELATION-AND-MERGE): record a **durable**,
             // journaled alias→canonical mapping so the effect is persisted, not
             // merely returned as a descriptor.
-            self.entity_resolution
-                .write()
-                .unwrap()
-                .insert(e.clone(), canonical.clone());
+            //
+            // RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE (path-compression): any
+            // prior alias that pointed to `e` is re-pointed directly to the
+            // canonical, flattening chains so the map stays acyclic and flat.
+            let keys: Vec<_> = map
+                .iter()
+                .filter(|(k, v)| *k != &canonical && *v == e)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in keys {
+                map.insert(k, canonical.clone());
+            }
+            map.insert(e.clone(), canonical.clone());
         }
         self.append_journal("resolve_entities", 0);
         Ok(ResolutionResult {

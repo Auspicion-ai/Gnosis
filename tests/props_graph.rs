@@ -1861,7 +1861,8 @@ async fn p_tp2_resolve_entities_overlap_and_convergence() {
 
     // --- overlapping re-resolution with a CHANGED canonical over a shared set ---
     // [e1, e2], canonical = e2: legal; the previously-canonical e1 reappears as
-    // an alias→e2, and e3 (not in the call) is left untouched (still → e1).
+    // an alias→e2, and e3 (not in the call) is PATH-COMPRESSED: it pointed to e1
+    // (now re-aliased to e2), so it is re-pointed to the new root e2.
     let b_ids = vec![e1.clone(), e2.clone()];
     let b_opts = ResolveEntitiesOptions {
         canonical_id: Some(e2.clone()),
@@ -1879,8 +1880,8 @@ async fn p_tp2_resolve_entities_overlap_and_convergence() {
     );
     assert_eq!(
         aliased(&store, &e3).await,
-        Some(e1.clone()),
-        "P-TP-2: e3 (outside the overlapping set) must stay →e1"
+        Some(e2.clone()),
+        "P-TP-2: e3 (outside the overlapping set) is path-compressed to the new root e2"
     );
 
     // --- re-apply the ORIGINAL identical call ([e1,e2,e3], e1) ---
