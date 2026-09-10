@@ -2072,6 +2072,443 @@ async fn p_tp2_resolve_entities_chain_flatten() {
 }
 
 // ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities 3+ call chain: multi-hop path-compression (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: a chain of three authoritative calls
+// must fully collapse every alias to the final canonical. Resolving `[e3,e4]` with
+// canonical=e3 records `{e4→e3}`; then `[e2,e3]` with canonical=e2 re-aliases e3 to
+// e2 and must re-point e4 to e2; then `[e1,e2]` with canonical=e1 re-aliases e2 to
+// e1 and must re-point e3 AND e4 directly to e1 — `entity_alias_canonical(e4) ==
+// Some(e1)` (multi-hop collapse, flat and acyclic).
+#[tokio::test]
+async fn p_tp2_resolve_entities_three_hop_chain_flatten() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2", "e3", "e4"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+    let e3 = (did.clone(), nid("e3"));
+    let e4 = (did.clone(), nid("e4"));
+
+    // --- call 1: canonical = e3 over [e3,e4] → {e4→e3} ---
+    let r1 = store
+        .resolve_entities(
+            &[e3.clone(), e4.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e3.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.canonical_id, e3);
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e3.clone()),
+        "P-TP-2: e4 should alias e3 after the first call"
+    );
+
+    // --- call 2: canonical = e2 over [e2,e3] → {e3→e2, e4→e2} ---
+    let r2 = store
+        .resolve_entities(
+            &[e2.clone(), e3.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e2.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.canonical_id, e2);
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e2.clone()),
+        "P-TP-2: e3 should now alias e2"
+    );
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e2.clone()),
+        "P-TP-2: e4 must be re-pointed (path-compressed) to e2, not stale e3"
+    );
+
+    // --- call 3: canonical = e1 over [e1,e2] → {e2→e1, e3→e1, e4→e1} ---
+    let r3 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should now alias e1"
+    );
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e1.clone()),
+        "P-TP-2: e3 must be re-pointed (path-compressed) to e1, not stale e2"
+    );
+    // Multi-hop collapse: e4 (two hops away) must land directly on e1.
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e1.clone()),
+        "P-TP-2: e4 must collapse all the way to e1 (multi-hop path-compression)"
+    );
+    assert_eq!(
+        aliased(&store, &e1).await,
+        None,
+        "P-TP-2: canonical e1 must not alias itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities flip where the new canonical was a root with aliases
+// (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: when a later call flips the canonical
+// to a node that was previously a root carrying its own aliases, those aliases
+// must be re-pointed to the new canonical (path-compression across a flip).
+// Resolving `[e2,e3]` with canonical=e2 records `{e3→e2}`; then `[e1,e2]` with
+// canonical=e1 records `{e2→e1, e3→e1}`; then re-resolving `[e1,e2]` with
+// canonical=e2 flips the map to `{e1→e2, e3→e2}` — e3 must be re-pointed to e2.
+#[tokio::test]
+async fn p_tp2_resolve_entities_flip_root_with_aliases() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2", "e3"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+    let e3 = (did.clone(), nid("e3"));
+
+    // --- call 1: canonical = e2 over [e2,e3] → {e3→e2} ---
+    let r1 = store
+        .resolve_entities(
+            &[e2.clone(), e3.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e2.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.canonical_id, e2);
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e2.clone()),
+        "P-TP-2: e3 should alias e2 after the first call"
+    );
+
+    // --- call 2: canonical = e1 over [e1,e2] → {e2→e1, e3→e1} ---
+    let r2 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should now alias e1"
+    );
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e1.clone()),
+        "P-TP-2: e3 must be re-pointed to e1"
+    );
+
+    // --- call 3: canonical = e2 over the SAME pair [e1,e2] → {e1→e2, e3→e2} ---
+    let r3 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e2.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.canonical_id, e2);
+    assert_eq!(
+        aliased(&store, &e1).await,
+        Some(e2.clone()),
+        "P-TP-2: previously-canonical e1 should now alias e2"
+    );
+    // Path-compression across a flip: e3 previously pointed to e1, which is now
+    // re-aliased to e2 — e3 must be re-pointed directly to e2.
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e2.clone()),
+        "P-TP-2: e3 must be re-pointed (path-compressed) to e2 across the flip"
+    );
+    assert_eq!(
+        aliased(&store, &e2).await,
+        None,
+        "P-TP-2: canonical e2 must not alias itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities duplicate entity_ids (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: duplicate entity_ids in a single call
+// must not create a self-loop or a duplicate alias entry. Resolving `[e1,e2,e2]`
+// with canonical=e1 yields exactly `{e2→e1}` — `entity_alias_canonical(e2) ==
+// Some(e1)`, `entity_alias_canonical(e1) == None`, and the result is well-formed
+// (no self-loop, no duplicate).
+#[tokio::test]
+async fn p_tp2_resolve_entities_duplicate_ids() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+
+    let r = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should alias e1 despite the duplicate entity_id"
+    );
+    assert_eq!(
+        aliased(&store, &e1).await,
+        None,
+        "P-TP-2: canonical e1 must not alias itself (no self-loop)"
+    );
+    // Well-formed durable map: the duplicate entity_id must not create a duplicate
+    // durable entry or a self-loop — the durable alias→canonical map holds exactly
+    // `{e2→e1}` (a single entry, confirmed by `aliased(e2) == Some(e1)` and
+    // `aliased(e1) == None`). The returned descriptor may carry one entry per
+    // non-canonical occurrence; the durable map is what the authoritative-overwrite
+    // semantics guarantee to be well-formed.
+    assert_eq!(r.canonical_id, e1, "P-TP-2: canonical must be e1");
+    assert!(
+        r.aliases.iter().all(|a| a.alias == e2 && a.canonical == e1),
+        "P-TP-2: every alias descriptor must be e2→e1 (no self-loop, no foreign target)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities multiple-roots map stays acyclic (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: disjoint resolutions keep disjoint
+// roots; an overlapping re-resolution must fold the second root's aliases into the
+// surviving canonical so every alias points to a root and the map stays acyclic
+// (no alias points to a non-root). Resolving `[e1,e2]` with canonical=e1 and
+// `[e3,e4]` with canonical=e3 yields `{e2→e1, e4→e3}`; then `[e1,e3]` with
+// canonical=e1 folds e3 (and its alias e4) into e1: `{e2→e1, e3→e1, e4→e1}`.
+#[tokio::test]
+async fn p_tp2_resolve_entities_multiple_roots_acyclic() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2", "e3", "e4"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+    let e3 = (did.clone(), nid("e3"));
+    let e4 = (did.clone(), nid("e4"));
+
+    // --- disjoint resolutions: {e2→e1} and {e4→e3} ---
+    let r1 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.canonical_id, e1);
+    let r2 = store
+        .resolve_entities(
+            &[e3.clone(), e4.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e3.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.canonical_id, e3);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should alias e1"
+    );
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e3.clone()),
+        "P-TP-2: e4 should alias e3"
+    );
+
+    // --- overlap: canonical = e1 over [e1,e3] → {e2→e1, e3→e1, e4→e1} ---
+    let r3 = store
+        .resolve_entities(
+            &[e1.clone(), e3.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e1.clone()),
+        "P-TP-2: e3 must be folded into e1"
+    );
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e1.clone()),
+        "P-TP-2: e4 must be re-pointed (path-compressed) to e1"
+    );
+    // Every alias points to a root (e1); no alias points to a non-root.
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 must still point to root e1"
+    );
+    assert_eq!(
+        aliased(&store, &e1).await,
+        None,
+        "P-TP-2: canonical e1 must not alias itself"
+    );
+    assert_eq!(
+        aliased(&store, &e3).await,
+        Some(e1.clone()),
+        "P-TP-2: e3 must point to root e1 (not to a non-root)"
+    );
+    assert_eq!(
+        aliased(&store, &e4).await,
+        Some(e1.clone()),
+        "P-TP-2: e4 must point to root e1 (not to a non-root)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities canonical currently an alias in the set (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: when the chosen canonical is currently
+// an alias pointing to a node in the set, the authoritative overwrite must drop the
+// alias entry for the canonical (it is never itself an alias) and re-point the
+// prior canonical to it. Resolving `[e1,e2]` with canonical=e1 yields `{e2→e1}`;
+// then re-resolving `[e1,e2]` with canonical=e2 flips to `{e1→e2}` —
+// `entity_alias_canonical(e2) == None` and `entity_alias_canonical(e1) == Some(e2)`.
+#[tokio::test]
+async fn p_tp2_resolve_entities_canonical_was_alias() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+
+    // --- call 1: canonical = e1 over [e1,e2] → {e2→e1} ---
+    let r1 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e1.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should alias e1 after the first call"
+    );
+
+    // --- call 2: canonical = e2 over the SAME pair [e1,e2] → {e1→e2} ---
+    let r2 = store
+        .resolve_entities(
+            &[e1.clone(), e2.clone()],
+            &ResolveEntitiesOptions {
+                canonical_id: Some(e2.clone()),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.canonical_id, e2);
+    // The chosen canonical e2 was previously an alias (e2→e1); the authoritative
+    // overwrite must drop that entry so e2 is never itself an alias.
+    assert_eq!(
+        aliased(&store, &e2).await,
+        None,
+        "P-TP-2: canonical e2 must never be an alias (prior e2→e1 dropped)"
+    );
+    assert_eq!(
+        aliased(&store, &e1).await,
+        Some(e2.clone()),
+        "P-TP-2: previously-canonical e1 should now alias e2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P-TP-2 — resolve_entities re-affirm no-op path: idempotence (TP, deterministic)
+// ---------------------------------------------------------------------------
+// RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE: re-applying an identical call is a
+// no-op — the map is unchanged and the two ResolutionResults are equal. Resolving
+// `[e1,e2]` with canonical=e1 yields `{e2→e1}`; re-applying the identical call
+// leaves `{e2→e1}` unchanged, `entity_alias_canonical(e2) == Some(e1)`, and the
+// two results are equal (idempotence).
+#[tokio::test]
+async fn p_tp2_resolve_entities_reaffirm_noop_idempotent() {
+    let (store, w, doc) = fresh_doc(&["e1", "e2"]).await;
+    let did = doc.document_id.clone();
+    let e1 = (did.clone(), nid("e1"));
+    let e2 = (did.clone(), nid("e2"));
+    let ids = vec![e1.clone(), e2.clone()];
+    let opts = ResolveEntitiesOptions {
+        canonical_id: Some(e1.clone()),
+        wiki_id: w.clone(),
+    };
+
+    // --- first call: canonical = e1 → {e2→e1} ---
+    let r1 = store.resolve_entities(&ids, &opts).await.unwrap();
+    assert_eq!(r1.canonical_id, e1);
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 should alias e1 after the first call"
+    );
+
+    // --- re-apply the identical call: unchanged {e2→e1}, equal result ---
+    let r2 = store.resolve_entities(&ids, &opts).await.unwrap();
+    assert_eq!(
+        r2, r1,
+        "P-TP-2: re-applying the identical call must be a no-op (equal result)"
+    );
+    assert_eq!(
+        aliased(&store, &e2).await,
+        Some(e1.clone()),
+        "P-TP-2: e2 must still alias e1 after the no-op re-apply"
+    );
+    assert_eq!(
+        aliased(&store, &e1).await,
+        None,
+        "P-TP-2: canonical e1 must not alias itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // P-TP-2 — explicit canonical dominates regardless of entity_ids order  (TP, deterministic)
 // ---------------------------------------------------------------------------
 // Pass `entity_ids` in several shuffled orders with an explicit canonical set to
