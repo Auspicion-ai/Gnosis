@@ -583,3 +583,65 @@ async fn f2_wiki_not_found_cannot_fire() {
         "F-2 Ok, not WikiNotFound"
     );
 }
+
+// ---------------------------------------------------------------------------
+// NEG-4 — unknown communityId → CommunityNotFound (F-1), even with others present
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn neg4_unknown_community_not_found_with_others_present() {
+    let (store, w, doc) = fresh_doc(&["n1"]).await;
+    let declared = store
+        .declare_community(
+            &[(doc.document_id.clone(), nid("n1"))],
+            &declare_opts(&w, "real community"),
+        )
+        .await
+        .unwrap();
+
+    // A community id that was never declared (the store has other communities).
+    let ghost = CommunityId("comm-99999".into());
+    assert_ne!(
+        ghost, declared.community_id,
+        "precondition: ghost is not the real id"
+    );
+    let err = store.get_community_context(&ghost).await.unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::CommunityNotFound,
+        "NEG-4 unknown communityId → CommunityNotFound (F-1)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NEG-5 — ghost wiki_id → Ok, never WikiNotFound (F-2)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn neg5_ghost_wiki_never_wiki_not_found() {
+    let store = Arc::new(Store::new());
+    // A community whose `wiki_id` is a wiki that was NEVER created as a wiki.
+    // `declare_community` does not validate the wiki exists, so the community
+    // record carries a `wiki_id` that is otherwise unknown. The accessor reads
+    // the wiki from the community record — it must succeed (`Ok`), never
+    // `WikiNotFound`.
+    let declared = store
+        .declare_community(
+            &[(did("d"), nid("n1"))],
+            &declare_opts(&wiki("ghost-wiki"), "ghost community"),
+        )
+        .await
+        .unwrap();
+
+    let ctx = store
+        .get_community_context(&declared.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.wiki_id,
+        wiki("ghost-wiki"),
+        "NEG-5 wiki from the community record"
+    );
+    assert_eq!(
+        ctx.community_id, declared.community_id,
+        "NEG-5 Ok, not WikiNotFound"
+    );
+}

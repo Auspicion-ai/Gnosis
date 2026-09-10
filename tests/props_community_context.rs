@@ -466,6 +466,9 @@ async fn p_sm1_read_side_effect_free() {
 
         let journal_before = store.journal_len();
         let state_before = store.community_state(&cid).await.unwrap();
+        // LOW-1: the register's side-effect-free observable also covers
+        // "revisions" — the read must not bump any document revision.
+        let rev_before = store.get_document(&did_a).await.unwrap().revision;
 
         let a = store.get_community_context(&cid).await;
         let a = match a {
@@ -479,6 +482,7 @@ async fn p_sm1_read_side_effect_free() {
         };
         let journal_after = store.journal_len();
         let state_after = store.community_state(&cid).await.unwrap();
+        let rev_after = store.get_document(&did_a).await.unwrap().revision;
 
         if journal_after != journal_before && cex.len() < 5 {
             cex.push(format!(
@@ -488,6 +492,11 @@ async fn p_sm1_read_side_effect_free() {
         if state_after != state_before && cex.len() < 5 {
             cex.push(format!(
                 "case {budget}: read changed community_state ({state_before:?} -> {state_after:?})"
+            ));
+        }
+        if rev_after != rev_before && cex.len() < 5 {
+            cex.push(format!(
+                "case {budget}: read bumped a document revision ({rev_before} -> {rev_after})"
             ));
         }
         let b = store.get_community_context(&cid).await;
@@ -562,8 +571,17 @@ async fn p_sm2_state_reflects_staleness() {
         if budget % 6 == 0 {
             // doc_b's m1 is a member only when the two-doc boundary added it;
             // rewrite a node that is NOT a member (n2 on doc_a is a member only
-            // when the 3-branch added it). Use a fresh non-member doc to be safe.
-            let (_, _, doc_c) = fresh_doc(&["x1"]).await;
+            // when the 3-branch added it). Create a genuinely non-member doc on
+            // the SAME store (HOST-1: `fresh_doc` built a NEW store whose first
+            // doc is `doc-0` — the same id as the outer `doc_a`, so the old probe
+            // rewrote the MEMBER's document, not a separate non-member doc).
+            let doc_c = new_doc(&store, &w, "doc-c").await;
+            // Regression: the touched doc is genuinely non-member — its id is not
+            // in the community's member set.
+            assert!(
+                !members.iter().any(|(d, _)| d == &doc_c.document_id),
+                "case {budget}: doc-c must not be a community member"
+            );
             apply_graph(
                 &store,
                 &doc_c,
@@ -759,7 +777,16 @@ async fn p_tp1_manual_summary_authority() {
 
         // Adversarial: a non-member touch — summary unchanged, state stays Fresh.
         if budget % 3 == 0 {
-            let (_, _, doc_c) = fresh_doc(&["x1"]).await;
+            // HOST-1: create the non-member doc on the SAME store (`fresh_doc`
+            // built a NEW store whose first doc is `doc-0` — the same id as the
+            // outer `doc_a`, so the old probe rewrote the MEMBER's document).
+            let doc_c = new_doc(&store, &w, "doc-c").await;
+            // Regression: the touched doc is genuinely non-member — its id is
+            // not in the community's member set.
+            assert!(
+                !members.iter().any(|(d, _)| d == &doc_c.document_id),
+                "case {budget}: doc-c must not be a community member"
+            );
             apply_graph(
                 &store,
                 &doc_c,
@@ -905,5 +932,198 @@ async fn p_tp2_faithful_projection() {
         "P-TP-2 BROKEN — {} counterexample(s):\n  - {}",
         cex.len(),
         cex.join("\n  - ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NEG-1 — Fact-incorporation isolation (negative probe, audit-recommended)
+// ---------------------------------------------------------------------------
+//
+// Two communities, one whose member is a fact location, one not; `update_fact`
+// on the fact flips ONLY the fact-incorporating community to `Stale` — the
+// non-incorporating community stays `Fresh` (extends P-SM-2's single-community
+// `update_fact` branch to the two-community isolation shape).
+#[tokio::test]
+async fn neg1_fact_incorporation_isolation() {
+    let store = Arc::new(Store::new());
+    let w = new_wiki(&store, "w").await;
+    let doc = new_doc(&store, &w, "facts").await;
+    apply_graph(&store, &doc, content_only_graph(&doc.document_id, &["n1"])).await;
+    // A fact `k1` whose canonical location is `(doc, fact-k1)`.
+    store
+        .create_fact(
+            &w,
+            &doc.document_id,
+            "k1",
+            "v1",
+            &[(doc.document_id.clone(), nid("n1"))],
+        )
+        .await
+        .unwrap();
+
+    // Community A incorporates the fact (member is the fact location); community
+    // B does not (member is a plain content node).
+    let c_inc = store
+        .declare_community(
+            &[(doc.document_id.clone(), nid("fact-k1"))],
+            &DeclareCommunityOptions {
+                summary: "incorporates".to_string(),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let c_not = store
+        .declare_community(
+            &[(doc.document_id.clone(), nid("n1"))],
+            &DeclareCommunityOptions {
+                summary: "not-incorporating".to_string(),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // `update_fact` on the incorporated fact.
+    store
+        .update_fact(
+            &w,
+            "k1",
+            &UpdateFactRequest {
+                value: "v2".to_string(),
+                citations: vec![(doc.document_id.clone(), nid("n1"))],
+            },
+        )
+        .await
+        .unwrap();
+
+    let inc = store
+        .get_community_context(&c_inc.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        inc.state,
+        gnosis::CommunityState::Stale,
+        "NEG-1 fact-incorporating community flips Stale"
+    );
+    let not = store
+        .get_community_context(&c_not.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        not.state,
+        gnosis::CommunityState::Fresh,
+        "NEG-1 non-incorporating community stays Fresh"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NEG-2 — Member-node removal via `update_document` (negative probe)
+// ---------------------------------------------------------------------------
+//
+// Rewriting a member's document REMOVING the member node surfaces
+// `mark_communities_stale`'s new-nodes-only behavior: staleness is computed from
+// the NEW graph's nodes, so a removed member node no longer matches and the
+// community stays `Fresh`. (This is the exact scenario HOST-1 accidentally
+// triggered — the old probe rewrote the member's doc with a non-member graph.)
+#[tokio::test]
+async fn neg2_member_node_removal_stays_fresh() {
+    let (store, w, doc) = fresh_doc(&["n1", "n2"]).await;
+    let members = vec![(doc.document_id.clone(), nid("n1"))];
+    let declared = store
+        .declare_community(
+            &members,
+            &DeclareCommunityOptions {
+                summary: "member-removal".to_string(),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Rewrite the member's document REMOVING the member node `n1` (replaced by
+    // `x1`). `mark_communities_stale` checks the new graph's nodes — `(doc, x1)`
+    // is not a member, so the community stays `Fresh`.
+    apply_graph(&store, &doc, content_only_graph(&doc.document_id, &["x1"])).await;
+
+    let ctx = store
+        .get_community_context(&declared.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.state,
+        gnosis::CommunityState::Fresh,
+        "NEG-2 removing the member node does not mark Stale (new-nodes-only)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NEG-3 — Stale → Fresh → Stale cycle (negative probe)
+// ---------------------------------------------------------------------------
+//
+// `re_derive_community` clears `Stale` to `Fresh`; a subsequent member change
+// must flip the community `Stale` AGAIN (the flag is not latched).
+#[tokio::test]
+async fn neg3_stale_fresh_stale_cycle() {
+    let (store, w, doc) = fresh_doc(&["n1", "n2"]).await;
+    let members = vec![(doc.document_id.clone(), nid("n1"))];
+    let declared = store
+        .declare_community(
+            &members,
+            &DeclareCommunityOptions {
+                summary: "cycle".to_string(),
+                wiki_id: w.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Member change → Stale.
+    apply_graph(
+        &store,
+        &doc,
+        content_only_graph(&doc.document_id, &["n1", "n2"]),
+    )
+    .await;
+    let ctx = store
+        .get_community_context(&declared.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.state,
+        gnosis::CommunityState::Stale,
+        "NEG-3 first Stale"
+    );
+
+    // Re-derive → Fresh.
+    store
+        .re_derive_community(&declared.community_id)
+        .await
+        .unwrap();
+    let ctx = store
+        .get_community_context(&declared.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.state,
+        gnosis::CommunityState::Fresh,
+        "NEG-3 Fresh after re-derive"
+    );
+
+    // Change the member again → Stale again.
+    apply_graph(
+        &store,
+        &doc,
+        content_only_graph(&doc.document_id, &["n1", "n2"]),
+    )
+    .await;
+    let ctx = store
+        .get_community_context(&declared.community_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.state,
+        gnosis::CommunityState::Stale,
+        "NEG-3 member change after re-derive flips Stale again"
     );
 }
