@@ -13,6 +13,13 @@ use crate::store::{DocumentId, NodeId};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+// §7.8 F6 — RAG evaluation harness (the four pure deterministic metric fns).
+pub mod eval;
+
+// §7.8 F6 — re-export the metric surface so `gnosis::contextual_precision` etc.
+// resolve (the paths the TestWriter calls).
+pub use self::eval::{contextual_precision, contextual_recall, mrr_at_k, ndcg_at_k};
+
 /// §4.5.3 — the RRF constant (`k = 60`). Pinned by the spec; a TestWriter
 /// derives the exact merged ordering from input lists using this value.
 pub const RRF_K: f64 = 60.0;

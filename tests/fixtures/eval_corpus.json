@@ -1,0 +1,49 @@
+[
+  {
+    "query": "what is the capital of France",
+    "wiki_id": "w_geo",
+    "mode": "flat",
+    "top_k": 5,
+    "relevant": [
+      ["d_paris", "n_paris_capital"],
+      ["d_france", "n_france_overview"]
+    ]
+  },
+  {
+    "query": "who discovered penicillin",
+    "wiki_id": "w_sci",
+    "mode": "graph",
+    "top_k": 3,
+    "relevant": [
+      ["d_fleming", "n_fleming_penicillin"]
+    ]
+  },
+  {
+    "query": "quantum entanglement explained",
+    "wiki_id": "w_phys",
+    "mode": "vector",
+    "top_k": 4,
+    "relevant": [
+      ["d_qm", "n_entanglement"],
+      ["d_qm", "n_bell_inequality"]
+    ]
+  },
+  {
+    "query": "rust ownership memory safety",
+    "wiki_id": "w_prog",
+    "mode": "hybrid",
+    "top_k": 5,
+    "relevant": [
+      ["d_rust", "n_ownership"],
+      ["d_rust", "n_borrowing"],
+      ["d_rust", "n_lifetimes"]
+    ]
+  },
+  {
+    "query": "unrelated empty-relevant probe",
+    "wiki_id": "w_probe",
+    "mode": "flat",
+    "top_k": 2,
+    "relevant": []
+  }
+]

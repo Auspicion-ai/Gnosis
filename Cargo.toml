@@ -28,6 +28,12 @@ wiremock = "0.6"
 name = "gnosis"
 path = "src/main.rs"
 
+# §7.8 F6 — the RAG-evaluation harness `[[bin]]` (a second bin alongside
+# `gnosis`; no new deps). RED-stage stub.
+[[bin]]
+name = "gnosis-eval"
+path = "src/bin/gnosis_eval.rs"
+
 [lib]
 name = "gnosis"
 path = "src/lib.rs"

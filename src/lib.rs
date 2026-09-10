@@ -29,6 +29,10 @@ pub use self::wire::status::HealthReport;
 // §4.5.3 retrieval-stack pure helpers (RRF fusion, §4.5.3 — k=60, EXACT rule).
 pub use self::retrieval::{rrf_fuse, RRF_K};
 
+// §7.8 F6 — the four pure deterministic RAG-evaluation metric fns (re-exported
+// so the TestWriter reaches them as `gnosis::contextual_precision` etc.).
+pub use self::retrieval::{contextual_precision, contextual_recall, mrr_at_k, ndcg_at_k};
+
 // §4.1 document-store public API surface (re-exported for the shell / tests).
 pub use self::store::{
     Alias, BlockedBy, CandidateFact, Community, CommunityId, CommunityState, CompressionMode,
