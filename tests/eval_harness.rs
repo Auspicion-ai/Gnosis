@@ -9,10 +9,7 @@
 //! set-semantics, nDCG first-occurrence), the no-panic/no-NaN boundedness
 //! cross-cutting state, the §8 corpus-parsing + metric-computation path, and the
 //! §8 `mode` serde note (PascalCase `QueryMode`, lowercase→variant manual map).
-//!
-//! **RED-stage.** This suite compiles against the stubs in `src/retrieval/eval.rs`
-//! (whose bodies are `todo!()` placeholders) and FAILS at runtime — the failing
-//! red set. The Implementer replaces the stub bodies to go green.
+//! GREEN — the metric fns in `src/retrieval/eval.rs` are implemented (387 tests).
 
 use gnosis::{contextual_precision, contextual_recall, mrr_at_k, ndcg_at_k};
 use gnosis::{DocumentId, NodeId, QueryMode, RagResultItem, Source};

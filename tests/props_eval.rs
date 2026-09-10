@@ -22,10 +22,7 @@
 //!
 //! Sum = **330** generated cases (≤ 400). stop-after-5: a row aborts and reports
 //! at most 5 distinct counterexamples.
-//!
-//! **RED-stage.** All assertions route through the `src/retrieval/eval.rs` stub
-//! fns (`todo!()`), so every row FAILS at runtime — the failing red set. The
-//! Implementer fills the stub bodies to go green.
+//! GREEN — the metric fns in `src/retrieval/eval.rs` are implemented (387 tests).
 
 use gnosis::{contextual_precision, contextual_recall, mrr_at_k, ndcg_at_k};
 use gnosis::{DocumentId, NodeId, RagResultItem, Source};
