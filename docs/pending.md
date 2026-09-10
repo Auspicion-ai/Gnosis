@@ -51,5 +51,6 @@ session is docs-only (read-only on `src/`/`tests/`).
 
 ## SPECULATIVE
 
-_(No Gnosis-specific speculative items yet — the parked layers are recorded in
-the suite `docs/pending.md` (D3/D5/D6/D8/D9) and the spec §7 gaps.)_
+| Item | Disposition / revisit condition |
+| --- | --- |
+| **F4-LLM — automatic community / manual-enrichment pass via a harnessed LLM** | **SPECULATIVE / FUTURE-INTEGRATION (2026-09-09).** A suite tool with a **harnessed LLM** (Familiar, Astrographer, or Emerald) drives Gnosis's existing **manual-override-authoritative** enrichment surfaces (`declareCommunity`/`updateCommunitySummary`, `resolveEntities`, `mergeFacts`) to run an automatic enrichment pass — the LLM *proposes*, Gnosis's manual-override invariants stay authoritative (the LLM host is a caller, not an engine-internal automatic pass). **Not a Gnosis-repo code unit** (Gnosis has no text-generation provider; `EmbeddingProvider` is embed-only). **Revisit condition:** a suite tool with a harnessed LLM lands a text-generation seam and wants to drive Gnosis's enrichment surfaces; if a wire surface is needed, the shell-integration unit must land first. Contract: `docs/specs/f4-llm-enrichment-integration.md`. |
