@@ -62,7 +62,7 @@ against the actual public API and the GREEN behavior.
 | **P-TP-1** | TP | `setReferenceState` is a **targeted** no-clobber mutation: only the matched reference edge(s)' `state` changes; the document's node set and every other edge (identity **and** state) are preserved, and the revision advances by exactly one. | `gen_reference_state` | Let `G_before = getDocument(doc).graph` and `G_after` after `setReferenceState`. Then `G_after.nodes == G_before.nodes`, every edge except the matched reference edge has identical source/target/kind/state in `G_before` and `G_after`, the matched reference edge's `state == Some(requested)`, and `revision_after == revision_before + 1`. |
 | **P-TP-2** | TP | `resolveEntities` **same-call idempotent + authoritative-overwrite convergence** (decision RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE): re-applying the **identical** `(entity_ids, canonical_id)` call leaves the durable alias→canonical mapping unchanged — re-applying the identical call does **not** flip an alias's canonical. Each call is an **authoritative overwrite**: it re-stabilizes the durable map to an **acyclic, flat** alias graph — the chosen canonical is never itself an alias (its prior entry is dropped) and every alias in the requested set points **directly** to the canonical, with any prior alias that pointed to a now-re-aliased node re-pointed via path-compression. A later manual call supersedes an earlier one (manual-vs-manual last-write-wins); the §4.2.9.2 "never overwritten by an **automatic** computation" invariant is preserved. **Overlap convergence is now GUARANTEED** — no residual alias, no cycle. | `gen_entities` | After `resolveEntities(ids, {canonical_id: c})`, snapshot `entityAliasCanonical(a)` for every alias `a`; re-apply the identical call, then re-read — every recorded alias still maps to the same canonical, and the two `ResolutionResult`s (merged + aliases) are equal. For an overlapping re-resolution with a **different** canonical, the map fully converges (no residual alias, no cycle): the canonical is never an alias and every alias **in the requested set** (and any path-compressed prior alias) points directly to it. *(The map may legitimately hold multiple roots from disjoint resolutions — "every alias points directly to the canonical" is scoped to the requested set + path-compressed aliases, not the whole map.)* |
 | **P-TP-3** | TP | `mergeFacts` idempotent / union-stable: merging an already-merged set (or its post-merge superset) with the same canonical key is a no-op — the persisted fact's `value` is unchanged and its `citations` equal the deduped union of the merged facts' citations (no drift, no dupes). | `gen_facts` | `mergeFacts(keys, {canonical_key: c})`; then `getFact(w, c)` after one application vs. after two (and after merging `keys ∪ {c}`) returns the identical `value`, and its `citations` set equals the deduped union of the merged facts' citation sets in both reads. |
-| **P-TP-4** | TP | Manual-override authority: a manually declared community's `summary` is never overwritten by an automatic computation/member-touching operation; it changes only via an explicit `updateCommunitySummary`. *(This is an override-authority **smoke check** — the manual `summary` persists and only an explicit `updateCommunitySummary` changes it — because automatic community-summary derivation is PARKED (`docs/pending.md` F4). Duplicate member node ids are stored **verbatim** (`node_ids.to_vec()`), never de-duplicated.)* | `gen_community` | `declareCommunity(members, {summary, w})`; apply a member-touching operation (an `addTriple` whose `subject` is a member); `getCommunity(id).summary` still equals the manual `summary`. After `updateCommunitySummary(id, new)`, `getCommunity(id).summary == new`. |
+| **P-TP-4** | TP | Manual-override authority: a manually declared community's `summary` is never overwritten by an automatic computation/member-touching operation; it changes only via an explicit `updateCommunitySummary`. *(This is an override-authority **smoke check** — the manual `summary` persists and only an explicit `updateCommunitySummary` changes it — because automatic community-summary derivation is PARKED (`docs/pending.md` F4). Duplicate member node ids are stored **verbatim** (`node_ids.to_vec()`), never de-duplicated.)* | `gen_community` | `declareCommunity(members, {summary, w})`; apply a member-touching operation (`updateDocument` rewriting a member node, or `update_fact` on an incorporated fact — the crate-faithful `mark_communities_stale` triggers); `getCommunity(id).summary` still equals the manual `summary`. After `updateCommunitySummary(id, new)`, `getCommunity(id).summary == new`. |
 
 ---
 
@@ -121,15 +121,16 @@ and adversarial input shapes (in addition to the nominal case):
   re-merging `keys ∪ {canonical}`. Adversarial: a **second `merge_facts` with a
   larger key set** (a broader union reflects the newest set); ensure conflicting
   `value`s are never generated here (→ `ConflictError` is a fail-state, excluded).
-- **P-TP-4 `gen_community`** — nominal: one community, then a triple on a member
-  node. Boundaries: a community whose members span **two** documents; a community
-  of exactly one member; an `addTriple` on a non-member node (nothing should touch
-  the summary) as well as on a member; then an explicit `updateCommunitySummary`.
-  Adversarial: two communities, only one of whose members is touched — only that
-  community's summary is at stake, and neither summary may change automatically;
-  member set repeated with a duplicate node id — `declare_community` stores
-  `node_ids` **verbatim** and does **not** de-duplicate, so `members` may contain
-  duplicate ids (asserted as stored).
+- **P-TP-4 `gen_community`** — nominal: one community, then a member-touching
+  operation (`updateDocument` rewriting a member node, or `update_fact` on an
+  incorporated fact). Boundaries: a community whose members span **two** documents;
+  a community of exactly one member; an `updateDocument` on a **non-member** node
+  (nothing should touch the summary) as well as on a member; then an explicit
+  `updateCommunitySummary`. Adversarial: two communities, only one of whose members
+  is touched — only that community's summary is at stake, and neither summary may
+  change automatically; member set repeated with a duplicate node id —
+  `declare_community` stores `node_ids` **verbatim** and does **not** de-duplicate,
+  so `members` may contain duplicate ids (asserted as stored).
 
 ---
 
@@ -183,3 +184,142 @@ reviewer may separately request **negative** generators that confirm the
 `ValidationError`/`DocumentNotFound`/`WikiNotFound`/`ConflictError`/
 `CycleDetected`/`HopLimitExceeded` shapes — those are a §4.2 fail-state concern
 (documented in `docs/specs/gnosis.md` §4.2/§6), **outside** this register.
+
+---
+
+# §7.5 F4 — Community retrieval — `getCommunityContext` PBT rows
+
+- **Unit**: §7.5 F4 community retrieval — `getCommunityContext` (the new
+  read-only `RagStore` trait method returning the pre-joined `CommunityContext`
+  unit; decision `F4-COMMUNITY-RETRIEVAL`). Exercises
+  `tests/props_community_context.rs` (+ `tests/community_context_integration.rs`).
+- **Spec**: `docs/specs/f4-community-context-spec.md` (the F4 behavior contract);
+  `docs/specs/gnosis.md` §4.2.8/§4.2.8.4/§4.4.1a/§4.4.3/§7.5;
+  `docs/specs/f4-community-summaries-review.md` (the re-scoped verdict).
+- **Date**: 2026-09-09
+- **Role**: `role_spec_writer` — author of this **property register** (artifact #1
+  of the §4.2 PBT gate; the F4 rows extend the same register).
+
+**PBT-gate contract (unchanged).** The F4 rows follow the same mandatory
+discipline as the §4.2 rows: a **deterministic pinned seed**, **≤100 generated
+cases per row**, **≤400 total across the unit's property layer**,
+**stop-after-5** (≤5 distinct held/broken counterexamples per row). Each row is
+recorded **held** or **broken** with its **strategy-id**. Every row below is an
+**invariant TRUE of the green implementation** of `get_community_context` — the
+accessor is a pre-joined read of `get_community` + `community_state` (no
+derivation, no generation, no mutation; side-effect-free; deterministic).
+
+**Scope note.** The F4 rows are **invariant-only** (P-IM/P-SM/P-TP) and never
+FS-n rows. The **only** fail-state of `get_community_context` is
+`CommunityNotFound` (a `communityId`-keyed accessor derives the wiki from the
+community record, so `WikiNotFound` cannot fire — matching `get_community`'s
+FS-25). That fail-state is a §4.2.8.5/§6 concern, **outside** this register; the
+generators below emit only **legal** inputs (a declared community).
+
+### F4 property table
+
+`Property-id | Class | Invariant | Strategy-id | Observable-as-property`
+
+| Property-id | Class | Invariant | Strategy-id | Observable-as-property |
+|---|---|---|---|---|
+| **P-IM-1** | IM | Context determinism: equal store state → equal `CommunityContext`. Two consecutive `get_community_context` reads with **no intervening mutation** return field-for-field equal values. | `gen_ctx_determinism` | Declare a community; read `get_community_context(id)` twice with no mutation between; the two `CommunityContext` values are `==` (community_id, wiki_id, summary, members, state all equal). |
+| **P-IM-2** | IM | Membership completeness: `context.members` **exactly equals** the declared member set — complete, in stored order, with duplicate ids stored **verbatim** (never de-duplicated). | `gen_ctx_members` | Declare a community with a known `node_ids` set; read the context; `context.members == node_ids.to_vec()` (same length, same order, same elements, duplicates preserved). |
+| **P-SM-1** | SM | Read side-effect-free: `get_community_context` performs **no mutation** — consecutive reads with no mutation are equal, and the read appends **no journal entry** and changes **no store state** (communities, community_states, revisions). | `gen_ctx_side_effect_free` | Declare a community; snapshot the journal length and the `community_state`; read the context; assert the read returned `Ok`, the journal length is unchanged, the `community_state` is unchanged, and a second read is equal. |
+| **P-SM-2** | SM | State reflects staleness: `context.state` is `Fresh` on declaration, `Stale` after a member node/edge change, `Fresh` again after `re_derive_community`; `summary` and `members` are **unchanged** throughout (read-only). | `gen_ctx_staleness` | Declare a community (state `Fresh`); apply a member-touching operation (`updateDocument` rewriting a member node, or `update_fact` on a fact the community incorporates — the crate-faithful `mark_communities_stale` triggers) → `context.state == Stale`; call `re_derive_community(id)` → `context.state == Fresh`; assert `context.summary` and `context.members` are identical across all three reads. |
+| **P-TP-1** | TP | Manual-summary authority: `context.summary` **always equals the manual summary** and is **never auto-regenerated** — it survives a member change + `re_derive_community` unchanged, and changes only via an explicit `update_community_summary` (§4.2.8.4). | `gen_ctx_manual_summary` | Declare with a manual `summary`; apply a member-touching operation (`updateDocument` rewriting a member node, or `update_fact` on an incorporated fact) + `re_derive_community`; `context.summary == summary` (unchanged). After `update_community_summary(id, new)`, `context.summary == new`. |
+| **P-TP-2** | TP | Faithful projection: `get_community_context` is a pre-joined read of `get_community` + `community_state` — `community_id`/`wiki_id`/`summary`/`members` come from `get_community`, `state` from `community_state`. | `gen_ctx_projection` | Declare a community; read `get_community(id)`, `community_state(id)`, and `get_community_context(id)`; assert `context.community_id == c.community_id`, `context.wiki_id == c.wiki_id`, `context.summary == c.summary`, `context.members == c.members`, and `context.state == community_state(id)`. |
+
+### F4 generator-coverage note (per row)
+
+The TestWriter's `strategy-id` generators should also probe the following boundary
+and adversarial input shapes (in addition to the nominal case):
+
+- **P-IM-1 `gen_ctx_determinism`** — nominal: one community, two reads. Boundaries:
+  a community whose members span **two** documents; a **single-member** community;
+  a community in `Stale` state (determinism holds regardless of state). Adversarial:
+  an intervening **unrelated** mutation (an `updateDocument` on a **non-member**
+  node, or an `addTriple` — which never marks a community stale) between the two
+  reads — the context must still be equal (the unrelated mutation does not touch
+  this community).
+- **P-IM-2 `gen_ctx_members`** — nominal: a community with several members. Boundaries:
+  a **single-member** community; members spanning **two** documents; a member that is
+  a **fact location** (membership is by declared id, not node kind). Adversarial: a
+  member set with a **duplicate node id** — `declare_community` stores `node_ids`
+  **verbatim** and does **not** de-duplicate, so `context.members` must contain the
+  duplicate (asserted as stored).
+- **P-SM-1 `gen_ctx_side_effect_free`** — nominal: one community, one read. Boundaries:
+  a community in `Stale` state (the read must not clear it); a community whose
+  members span two documents. Adversarial: a read on a community that was just
+  `re_derive_community`-ed (the read must not re-append a journal entry or change
+  the now-`Fresh` state).
+- **P-SM-2 `gen_ctx_staleness`** — nominal: one community, a member-touching
+  `updateDocument` (rewriting a member node) then `re_derive_community`. Boundaries:
+  a member-touching op on a **non-member** node (state must stay `Fresh` — only a
+  member change marks `Stale`); a community whose members span two documents (a
+  member change in either document marks `Stale`); an `update_fact` on a fact the
+  community incorporates (also marks `Stale`). Adversarial: two communities, only
+  one of whose members is touched — only that community's state flips to `Stale`,
+  the other stays `Fresh`; a `re_derive_community` on an already-`Fresh` community
+  (stays `Fresh`, no error).
+- **P-TP-1 `gen_ctx_manual_summary`** — nominal: one community, a member-touching
+  `updateDocument` + re-derive, then `update_community_summary`. Boundaries: a
+  community whose members span two documents; a single-member community. Adversarial:
+  a member-touching op on a **non-member** node (summary unchanged, state stays
+  `Fresh`); an `update_community_summary` to a **new** non-empty summary (context
+  reflects the new manual summary, state unchanged).
+- **P-TP-2 `gen_ctx_projection`** — nominal: one community, all three reads.
+  Boundaries: a community in `Stale` state (state field equals `community_state`);
+  a community whose members span two documents. Adversarial: a community whose
+  summary was updated (context.summary equals the updated `get_community` summary);
+  a community whose members contain a duplicate id (context.members equals the
+  stored `get_community` members verbatim).
+
+### F4 API notes for the TestWriter
+
+Exact public API used by the F4 rows (trait `RagStore` impl `Store`; types
+re-exported from `src/lib.rs`):
+
+- **`get_community_context(&CommunityId) -> impl Future<Output = Result<CommunityContext, StoreError>> + Send`**
+  — the new read-only accessor. `CommunityContext { community_id, wiki_id,
+  summary, members, state }` (re-exported as `gnosis::CommunityContext`).
+  Fail-state: **`CommunityNotFound` only** (a `communityId`-keyed accessor derives
+  the wiki from the community record, so `WikiNotFound` cannot fire — matching
+  `get_community`'s FS-25). The generators emit only **declared** communities, so
+  the invariant rows never drive this fail-state.
+- **`declare_community(&[(DocumentId,NodeId)], &DeclareCommunityOptions) -> Result<Community, _>`**
+  — `DeclareCommunityOptions { summary, wiki_id }`. Requires a **non-empty** node
+  set and a **non-empty** summary (else `ValidationError`); a freshly declared
+  community is `Fresh` (§4.4.3). The generators must only emit non-empty member
+  sets and non-empty summaries.
+- **`get_community(&CommunityId) -> Result<Community, _>`** — the `Community {
+  community_id, members, summary, wiki_id }` record (P-TP-2's projection source).
+- **`community_state(&CommunityId) -> Result<CommunityState, _>`** — `Fresh`/`Stale`
+  (P-TP-2's state source; `Fresh` by default, §4.4.1a/§4.4.3).
+- **`re_derive_community(&CommunityId) -> Result<Community, _>`** — clears the
+  `STALE` flag (refresh to `Fresh`); the manual summary is authoritative and never
+  regenerated (§4.2.8.4).
+- **`update_community_summary(&CommunityId, &str) -> Result<Community, _>`** —
+  sets the manual summary (non-empty required); does **not** touch `community_states`.
+- **`add_triple(&(DocumentId,NodeId), &str, &(DocumentId,NodeId), &WikiId) -> Result<Triple, _>`**
+  — **NOT** a staleness trigger: `add_triple` does **not** call
+  `mark_communities_stale` (it only appends a journal entry and pushes to
+  `triple_store`). The crate-faithful `mark_communities_stale` triggers are
+  `update_document` (rewriting a member node, line 2495) and `update_fact` on a fact
+  the community incorporates (line 2256 via `propagate_fact_staleness`) — use those
+  for P-SM-2/P-TP-1/P-TP-4.
+- **`update_document(&DocumentId, UpdateDocumentRequest) -> Result<Document, _>`** —
+  rewriting a node that is a member of a community marks that community `Stale`
+  (`mark_communities_stale`, line 2495) — the crate-faithful member-touching trigger
+  (P-SM-2/P-TP-1/P-TP-4).
+- **`update_fact(&WikiId, &str, &UpdateFactRequest) -> Result<Fact, _>`** — updating a
+  fact the community incorporates marks the community `Stale` (line 2256 via
+  `propagate_fact_staleness`) — the crate-faithful incorporated-fact trigger.
+
+**Generator constraints (fail-states are NOT invariants).** Every F4 `strategy-id`
+must generate only **legal inputs** as its nominal domain — a **declared**
+community with a non-empty member set and non-empty summary. Boundary/probe shapes
+must stay on the legal side of the §4.2 guards, because a row that drives a
+`StoreError` produces no value on which to assert the invariant. The adversarial
+reviewer may separately request a **negative** generator that confirms the
+`CommunityNotFound` shape (an unknown `community_id`) — that is a §4.2.8.5/§6
+fail-state concern, **outside** this register.
