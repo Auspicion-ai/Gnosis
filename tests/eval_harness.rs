@@ -782,6 +782,63 @@ fn corpus_parsing_and_metric_path() {
 }
 
 // ---------------------------------------------------------------------------
+// §10 harness smoke — RUNS the `gnosis-eval` `[[bin]]` against the §8 corpus
+// fixture and asserts the §7.3 report shape. This is a distinct concern from
+// `corpus_parsing_and_metric_path` (which parses the corpus + computes metrics
+// via the public fns): this test invokes the built bin itself, end-to-end.
+// ---------------------------------------------------------------------------
+
+/// §10 harness smoke: run the built `gnosis-eval` bin (default, non-`--live`, so
+/// it uses the deterministic fake provider — reproducible in CI) against
+/// `tests/fixtures/eval_corpus.json` and assert the §7.3 report shape: the four
+/// metric field names and the aggregate block.
+#[test]
+fn bin_smoke_report_shape() {
+    // Cargo sets `CARGO_BIN_EXE_gnosis-eval` for integration tests when a
+    // `[[bin]]` named `gnosis-eval` exists (Cargo.toml §7.8).
+    let bin = env!("CARGO_BIN_EXE_gnosis-eval");
+    let corpus = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/eval_corpus.json"
+    );
+
+    let out = std::process::Command::new(bin)
+        .arg(corpus)
+        .output()
+        .expect("gnosis-eval bin must run");
+
+    // §7.2.6: exit 0 if every case ran (no hard failure).
+    assert!(
+        out.status.success(),
+        "gnosis-eval must exit 0, got {:?}; stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // §7.3: the report must contain the four metric field names.
+    for field in [
+        "contextual_precision",
+        "contextual_recall",
+        "ndcg_at_k",
+        "mrr_at_k",
+    ] {
+        assert!(
+            stdout.contains(field),
+            "report must contain metric field {field:?}; stdout:\n{stdout}"
+        );
+    }
+
+    // §7.3: the report must contain the aggregate block (the arithmetic mean over
+    // the cases that produced a RagResult).
+    assert!(
+        stdout.contains("aggregate (mean over"),
+        "report must contain the aggregate block; stdout:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §8 `mode` serde note: `QueryMode` has no `#[serde(rename_all)]`, so its serde
 // representation is PascalCase; the lowercase corpus string must be mapped to the
 // variant manually, NOT deserialized directly.

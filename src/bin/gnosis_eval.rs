@@ -34,13 +34,13 @@ struct CorpusCase {
 
 /// §8 `mode` serde note: `QueryMode` has no `#[serde(rename_all)]` (PascalCase
 /// serde), so the lowercase corpus string is mapped to the variant MANUALLY.
-fn map_mode(s: &str) -> QueryMode {
+fn map_mode(s: &str) -> Result<QueryMode, String> {
     match s {
-        "flat" => QueryMode::Flat,
-        "graph" => QueryMode::Graph,
-        "vector" => QueryMode::Vector,
-        "hybrid" => QueryMode::Hybrid,
-        other => panic!("unknown mode {other}"),
+        "flat" => Ok(QueryMode::Flat),
+        "graph" => Ok(QueryMode::Graph),
+        "vector" => Ok(QueryMode::Vector),
+        "hybrid" => Ok(QueryMode::Hybrid),
+        other => Err(format!("unknown mode {other}")),
     }
 }
 
@@ -64,11 +64,90 @@ impl EmbeddingProvider for FakeProvider {
     }
 }
 
+/// §7.1 `--live` — a real embedding provider that calls the local Ollama
+/// embeddings endpoint via `reqwest` (live data acquisition for `vector`/`hybrid`
+/// cases). Base URL from `GNOSIS_EVAL_OLLAMA_URL` (default
+/// `http://localhost:11434`); model from `GNOSIS_EVAL_OLLAMA_MODEL` (default
+/// `nomic-embed-text`). Distinct from `FakeProvider`: this makes a real HTTP call.
+struct LiveProvider {
+    base_url: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl LiveProvider {
+    fn from_env() -> Self {
+        let base_url = std::env::var("GNOSIS_EVAL_OLLAMA_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let model = std::env::var("GNOSIS_EVAL_OLLAMA_MODEL")
+            .unwrap_or_else(|_| "nomic-embed-text".to_string());
+        Self {
+            base_url,
+            model,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl EmbeddingProvider for LiveProvider {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, StoreError>> + Send + '_>> {
+        let url = format!("{}/api/embed", self.base_url);
+        let model = self.model.clone();
+        let client = self.client.clone();
+        let text = text.to_string();
+        Box::pin(async move {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "model": model, "input": text }))
+                .send()
+                .await
+                .map_err(|_| StoreError::EmbeddingUnavailable)?;
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|_| StoreError::EmbeddingUnavailable)?;
+            let emb = body
+                .get("embeddings")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_array())
+                .ok_or(StoreError::EmbeddingUnavailable)?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            Ok(emb)
+        })
+    }
+    fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let url = format!("{}/api/tags", self.base_url);
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .get(&url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// A well-formed Provident graph: exactly one doc-head (ROOT → first node) and
 /// one doc-end (first node → END), plus the given content nodes.
 fn wellformed_graph(nodes: Vec<Node>) -> Graph {
-    let first = nodes[0].node_id.clone();
-    let doc = nodes[0].document_id.clone();
+    // Guard against an empty `nodes` slice: return a well-formed empty graph
+    // (no doc-head/doc-end edges) so a future refactor cannot panic on `nodes[0]`.
+    let Some(first_node) = nodes.first() else {
+        return Graph {
+            nodes,
+            edges: Vec::new(),
+        };
+    };
+    let first = first_node.node_id.clone();
+    let doc = first_node.document_id.clone();
     let edges = vec![
         Edge {
             source: (doc.clone(), NodeId("ROOT".to_string())),
@@ -119,11 +198,11 @@ async fn seed_store(
     let store = Store::new();
     store.set_engine_state(EngineState::Ready);
     if live {
-        // Real provider: not wired here (a real provider is selected by the
-        // operator's environment); fall back to the deterministic fake so the
-        // tool always runs.
-        store.set_embedding_provider(Arc::new(FakeProvider));
+        // §7.1 `--live`: the REAL embedding provider (Ollama via reqwest) for
+        // live vector/hybrid data acquisition.
+        store.set_embedding_provider(Arc::new(LiveProvider::from_env()));
     } else {
+        // Default: the deterministic fake provider (reproducible CI, no remote call).
         store.set_embedding_provider(Arc::new(FakeProvider));
     }
 
@@ -280,7 +359,13 @@ fn main() {
     let mut agg = [0.0f64; 4];
     let mut n = 0usize;
     for (idx, case) in cases.iter().enumerate() {
-        let mode = map_mode(&case.mode);
+        let mode = match map_mode(&case.mode) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
         let wiki_id = wiki_map
             .get(&case.wiki_id)
             .cloned()
