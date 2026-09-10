@@ -4265,13 +4265,21 @@ impl RagStore for Store {
 
     async fn get_community_context(
         &self,
-        _community_id: &CommunityId,
+        community_id: &CommunityId,
     ) -> Result<CommunityContext, StoreError> {
-        // §7.5 F4 — RED-stage stub. The Implementer lands the real pre-joined
-        // read of `get_community` + `community_state` (CommunityNotFound only)
-        // to go green. The `unimplemented!()` body makes every F4 assertion fail
-        // at runtime (the compile-with-stubs red set).
-        unimplemented!("get_community_context is a RED-stage stub (F4)")
+        // §7.5 F4 — a pre-joined read of `get_community` + `community_state`.
+        // Read-only, side-effect-free, deterministic. Fail-state:
+        // `CommunityNotFound` only — the wiki is read from the community record,
+        // never looked up by id, so `WikiNotFound` cannot fire.
+        let community = self.get_community(community_id).await?;
+        let state = self.community_state(community_id).await?;
+        Ok(CommunityContext {
+            community_id: community.community_id,
+            wiki_id: community.wiki_id,
+            summary: community.summary,
+            members: community.members,
+            state,
+        })
     }
 }
 

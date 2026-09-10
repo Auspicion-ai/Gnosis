@@ -314,9 +314,14 @@ async fn p_im1_context_determinism() {
         // `updateDocument` (rewrites a node that is NOT a member) or an
         // `addTriple` (never marks a community stale).
         if budget % 3 == 0 {
-            // Non-member node rewrite on doc_b (doc_b's nodes are not members
-            // unless the two-doc boundary added m1).
-            apply_graph(&store, &doc_b, content_only_graph(&did_b, &["m1"])).await;
+            // Non-member node rewrite on doc_b. doc_b's m1 is a member ONLY when
+            // the two-doc boundary added it (budget % 4 == 0); when both fire
+            // (budget % 12 == 0), rewriting m1 would legitimately flip the state
+            // Fresh -> Stale (H-2), so skip the adversarial rewrite in that case
+            // to keep it a genuine non-member touch.
+            if budget % 4 != 0 {
+                apply_graph(&store, &doc_b, content_only_graph(&did_b, &["m1"])).await;
+            }
         } else if budget % 4 == 0 {
             let _ = store
                 .add_triple(
