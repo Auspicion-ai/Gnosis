@@ -251,6 +251,23 @@ pub struct Community {
     pub wiki_id: WikiId,
 }
 
+/// §7.5 F4 — the pre-joined community retrieval unit returned by
+/// `get_community_context` (decision `F4-COMMUNITY-RETRIEVAL`). A **read-only**
+/// fusion of `get_community` (§4.2.8.2) + `community_state` (§4.4.1a/§4.4.3):
+/// the authoritative manual `summary` + the declared `members` node set + the
+/// current `state`. All fields are **verbatim** from the stored records — no
+/// derivation, no generation, no mutation. The derives are part of the contract
+/// (`PartialEq`/`Eq` let the TestWriter assert determinism/equality;
+/// `Serialize`/`Deserialize` consistent with the store types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityContext {
+    pub community_id: CommunityId,
+    pub wiki_id: WikiId,
+    pub summary: String,
+    pub members: Vec<(DocumentId, NodeId)>,
+    pub state: CommunityState,
+}
+
 /// A single `{from, to}` merge pair in `ResolutionResult.merged` (§4.2.9.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityPair {
@@ -1485,6 +1502,21 @@ pub trait RagStore: Send + Sync {
         provider: &dyn EmbeddingProvider,
         first_pass: &FirstPassOptions,
     ) -> impl Future<Output = Result<Vec<RagResultItem>, StoreError>> + Send;
+
+    /// §7.5 F4 — `getCommunityContext(communityId) → CommunityContext` (decision
+    /// `F4-COMMUNITY-RETRIEVAL`). A **read-only** pre-joined read of
+    /// `get_community` + `community_state`: returns the authoritative manual
+    /// `summary`, the declared `members` node set, and the current `state` as a
+    /// single `CommunityContext` value. No derivation, no generation, no
+    /// mutation; side-effect-free; deterministic. Fail-state: `CommunityNotFound`
+    /// **only** — a `communityId`-keyed accessor derives the wiki from the
+    /// community record, so `WikiNotFound` cannot fire (matching `get_community`'s
+    /// FS-25). **RED-stage stub** — the body is `unimplemented!()`; the
+    /// Implementer lands the real pre-joined read to go green.
+    fn get_community_context(
+        &self,
+        community_id: &CommunityId,
+    ) -> impl Future<Output = Result<CommunityContext, StoreError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -4229,6 +4261,17 @@ impl RagStore for Store {
         };
         let qvec = self.embed_text(query, provider).await?;
         Ok(self.vector_leg(&index, Some(wiki_id), &qvec, top_k as usize, first_pass))
+    }
+
+    async fn get_community_context(
+        &self,
+        _community_id: &CommunityId,
+    ) -> Result<CommunityContext, StoreError> {
+        // §7.5 F4 — RED-stage stub. The Implementer lands the real pre-joined
+        // read of `get_community` + `community_state` (CommunityNotFound only)
+        // to go green. The `unimplemented!()` body makes every F4 assertion fail
+        // at runtime (the compile-with-stubs red set).
+        unimplemented!("get_community_context is a RED-stage stub (F4)")
     }
 }
 

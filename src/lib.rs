@@ -35,16 +35,16 @@ pub use self::retrieval::{contextual_precision, contextual_recall, mrr_at_k, ndc
 
 // §4.1 document-store public API surface (re-exported for the shell / tests).
 pub use self::store::{
-    Alias, BlockedBy, CandidateFact, Community, CommunityId, CommunityState, CompressionMode,
-    ConsistencyReferenceReport, CreateDocumentRequest, DeclareCommunityOptions, DerivedIndexes,
-    DocState, Document, DocumentId, DocumentList, DocumentSummary, Edge, EdgeKind, EmbeddingCache,
-    EmbeddingProvider, EngineState, EngineStatus, EngineSubsystems, EntityPair, ExpandMode, Fact,
-    FactList, FieldType, FirstPassOptions, GetTriplesFilter, Graph, GraphTraceStep, HybridTrace,
-    LexicalIndex, ListDocumentsFilter, ListFactsFilter, MergeFactsOptions, MultiQueryOptions, Node,
-    NodeId, NodeKind, ProfileSummary, ProposalOutcome, QueryAuditEntry, QueryAuditFilters,
-    QueryMode, QueryTriplesOptions, RagChunk, RagParent, RagQueryOptions, RagResult, RagResultItem,
-    RagStore, RagStream, RagTrace, ReferenceState, Rejection, ResolutionResult,
-    ResolveEntitiesOptions, ResolveOptions, ResolvedFact, Source, Store, StoreError,
-    SubTaskDagOptions, TraceDescriptor, Triple, TripleDirection, TriplePattern,
+    Alias, BlockedBy, CandidateFact, Community, CommunityContext, CommunityId, CommunityState,
+    CompressionMode, ConsistencyReferenceReport, CreateDocumentRequest, DeclareCommunityOptions,
+    DerivedIndexes, DocState, Document, DocumentId, DocumentList, DocumentSummary, Edge, EdgeKind,
+    EmbeddingCache, EmbeddingProvider, EngineState, EngineStatus, EngineSubsystems, EntityPair,
+    ExpandMode, Fact, FactList, FieldType, FirstPassOptions, GetTriplesFilter, Graph,
+    GraphTraceStep, HybridTrace, LexicalIndex, ListDocumentsFilter, ListFactsFilter,
+    MergeFactsOptions, MultiQueryOptions, Node, NodeId, NodeKind, ProfileSummary, ProposalOutcome,
+    QueryAuditEntry, QueryAuditFilters, QueryMode, QueryTriplesOptions, RagChunk, RagParent,
+    RagQueryOptions, RagResult, RagResultItem, RagStore, RagStream, RagTrace, ReferenceState,
+    Rejection, ResolutionResult, ResolveEntitiesOptions, ResolveOptions, ResolvedFact, Source,
+    Store, StoreError, SubTaskDagOptions, TraceDescriptor, Triple, TripleDirection, TriplePattern,
     UpdateDocumentRequest, UpdateFactRequest, VectorIndex, Wiki, WikiId,
 };
