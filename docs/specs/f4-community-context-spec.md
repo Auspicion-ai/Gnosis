@@ -3,10 +3,11 @@
 - **Unit:** §7.5 F4 — community summaries, **re-scoped to a retrieval surface**
   (decision `F4-COMMUNITY-RETRIEVAL`; verdict in
   `docs/specs/f4-community-summaries-review.md`, PASS).
-- **Status:** **PLANNED-for-F4** — this is the behavior contract the F4 unit's
-  TestWriter derives its red set from. The `getCommunityContext` accessor is a
-  **new read-only `RagStore` trait method**; it is **not yet implemented** (the
-  Implementer lands it to green after the TestWriter's red set). Zero runtime
+- **Status:** **LANDED + GREEN (2026-09-09)** — the F4 unit is implemented and
+  trio-green (**411 tests**, clippy/fmt clean). This is the behavior contract the
+  F4 unit's TestWriter derived its red set from; the `getCommunityContext`
+  accessor is a **new read-only `RagStore` trait method** implemented in
+  `src/store/mod.rs` (see the F4 DONE row in `docs/next-steps.md`). Zero runtime
   change; zero new runtime deps.
 - **Gate:** proposal-review **PASSED** (re-scoped to retrieval) — decision
   `F4-COMMUNITY-RETRIEVAL` in `docs/decisions.md`; verdict + deliverable set +
@@ -89,7 +90,7 @@ fn get_community_context(
 ) -> impl Future<Output = Result<CommunityContext, StoreError>> + Send;
 ```
 
-Declared on the `RagStore` trait (`src/store/mod.rs:1051`), implemented by
+Declared on the `RagStore` trait (`src/store/mod.rs:1516`), implemented by
 `Store`. It is **read-only** and **additive** — it does not alter any existing
 trait method.
 
@@ -179,13 +180,13 @@ flag. The accessor does **not** change `state`; it only reports it.
 | # | Store state | `get_community_context` returns |
 | --- | --- | --- |
 | H-1 | A community declared via `declareCommunity(members, {summary, wiki_id})` | `Ok(CommunityContext)` with `community_id == the queried id`, `wiki_id == the declared wiki_id`, `summary == the manual summary` (verbatim), `members == the declared node set` (complete, stored order), `state == Fresh` (a freshly declared community is `Fresh`, §4.4.3). |
-| H-2 | After a member node/edge change that triggers `mark_communities_stale` — `updateDocument` rewriting a member node (line 2495), or `update_fact` on a fact the community incorporates (line 2256) | `Ok(CommunityContext)` with `state == Stale`; `summary` and `members` **unchanged** (read-only — the accessor does not mutate). |
+| H-2 | After a member node/edge change that triggers `mark_communities_stale` — `updateDocument` rewriting a member node (line 2527), or `update_fact` on a fact the community incorporates (line 2288) | `Ok(CommunityContext)` with `state == Stale`; `summary` and `members` **unchanged** (read-only — the accessor does not mutate). |
 | H-3 | After `re_derive_community(community_id)` on the `Stale` community | `Ok(CommunityContext)` with `state == Fresh`; `summary` and `members` **unchanged** (re-derive only clears the STALE flag; the manual summary is never regenerated). |
 | H-4 | After `update_community_summary(community_id, new)` | `Ok(CommunityContext)` with `summary == new` (the new manual summary, §4.2.8.4 authority); `state` **unchanged** (update_community_summary does not touch `community_states`). |
 | H-5 | A community whose members span **two documents** | `Ok(CommunityContext)` with `members` containing the full cross-document set (each `(DocumentId, NodeId)` present). |
 | H-6 | A **single-member** community | `Ok(CommunityContext)` with `members.len() == 1`. |
 | H-7 | A member that is a **fact location** (a `(DocumentId, NodeId)` pointing at a fact node) | `Ok(CommunityContext)` with that member present in `members` (membership is by declared id, not by node kind). |
-| H-8 | A community whose staleness was **never triggered** | `Ok(CommunityContext)` with `state == Fresh` (the `community_state` default, §4.4.1a/§4.4.3). The accessor must defensively `unwrap_or(Fresh)` like `community_state` (line 4008) — a `Fresh` default even if no `community_states` row exists. This defensive branch is **not directly constructible** via the public API (`declare_community` always inserts a `Fresh` row, line 3180), so the TestWriter asserts the **observable** (`Fresh` when staleness was never triggered), not the unconstructible pre-population state. |
+| H-8 | A community whose staleness was **never triggered** | `Ok(CommunityContext)` with `state == Fresh` (the `community_state` default, §4.4.1a/§4.4.3). The accessor must defensively `unwrap_or(Fresh)` like `community_state` (line 4040) — a `Fresh` default even if no `community_states` row exists. This defensive branch is **not directly constructible** via the public API (`declare_community` always inserts a `Fresh` row, line 3181), so the TestWriter asserts the **observable** (`Fresh` when staleness was never triggered), not the unconstructible pre-population state. |
 | H-9 | **Determinism** — two consecutive `get_community_context` calls with **no intervening mutation** | Both return **equal** `CommunityContext` values (field-for-field `==`). |
 | H-10 | **Membership completeness** — after declaration, `members` **exactly equals** the declared node set (no additions, no removals, no reordering). |
 | H-11 | **Manual-override** — after a member change + `re_derive_community`, `summary` still equals the manual summary (never auto-regenerated). |

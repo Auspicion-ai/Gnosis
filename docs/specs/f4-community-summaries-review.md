@@ -4,7 +4,7 @@
 - **Gate:** proposal-review gate (validity ∥ critique → architecture → change-analysis).
 - **Date:** 2026-09-09.
 - **Verdict:** **PASS — RE-SCOPED TO A RETRIEVAL SURFACE** (contingent on the user's go-ahead). The **derivation** surface is **invalid** (vacuous + redundant); the **retrieval** surface is a valid, delegable Gnosis-repo unit.
-- **Status:** proposal approved by review (re-scoped to retrieval); code/contract delegation awaits the user's go-ahead.
+- **Status:** proposal approved by review (re-scoped to retrieval); **LANDED + GREEN (2026-09-09)** — the re-scoped F4 unit is implemented and trio-green (411 tests, clippy/fmt clean). See the F4 DONE row in `docs/next-steps.md` + decision `F4-COMMUNITY-RETRIEVAL`.
 
 ## What F4 is (as stated) and why it was re-scoped
 

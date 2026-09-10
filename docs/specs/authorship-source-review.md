@@ -57,7 +57,7 @@ insufficient).
   authority(prior)`; otherwise the engine rejects with `InsufficientAuthority`.
 - **Enforced in the engine** (the single place holding both the prior record's
   persisted authority and the new call's authority) — authoritative + D4 parity.
-- **Opt-in / default-OFF** — the current contract + 387 tests pin these surfaces as
+- **Opt-in / default-OFF** — the current contract + 411 tests pin these surfaces as
   unconditional authoritative overwrites (manual-vs-manual last-write-wins, per
   `RESOLVE-ENTITIES-AUTHORITATIVE-OVERWRITE`); the lock is a new enforcement layer
   that defaults OFF (preserving current behavior).
@@ -80,7 +80,7 @@ insufficient).
   sensible value; the lock is opt-in/default-OFF. No existing behavior changes.
 - **But code-bearing:** changes `Community`/`Fact` (both `Serialize`/`Deserialize`,
   re-exported from `src/lib.rs`), the options structs, the `RagStore` trait
-  signatures, and the **387 green tests** that construct these types literally.
+  signatures, and the **411 green tests** that construct these types literally.
 - **Therefore doc/design-only now:** the F4-LLM integration is SPECULATIVE and the
   lock is a future feature. The code-bearing TDD unit (TestWriter red set from the
   spec, PBT register + property layer + audit per `PBT-GATE-MANDATORY`) lands when

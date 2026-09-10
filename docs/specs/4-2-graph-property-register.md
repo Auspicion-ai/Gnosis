@@ -304,15 +304,15 @@ re-exported from `src/lib.rs`):
   — **NOT** a staleness trigger: `add_triple` does **not** call
   `mark_communities_stale` (it only appends a journal entry and pushes to
   `triple_store`). The crate-faithful `mark_communities_stale` triggers are
-  `update_document` (rewriting a member node, line 2495) and `update_fact` on a fact
-  the community incorporates (line 2256 via `propagate_fact_staleness`) — use those
+  `update_document` (rewriting a member node, line 2527) and `update_fact` on a fact
+  the community incorporates (line 2288 via `propagate_fact_staleness`) — use those
   for P-SM-2/P-TP-1/P-TP-4.
 - **`update_document(&DocumentId, UpdateDocumentRequest) -> Result<Document, _>`** —
   rewriting a node that is a member of a community marks that community `Stale`
-  (`mark_communities_stale`, line 2495) — the crate-faithful member-touching trigger
+  (`mark_communities_stale`, line 2527) — the crate-faithful member-touching trigger
   (P-SM-2/P-TP-1/P-TP-4).
 - **`update_fact(&WikiId, &str, &UpdateFactRequest) -> Result<Fact, _>`** — updating a
-  fact the community incorporates marks the community `Stale` (line 2256 via
+  fact the community incorporates marks the community `Stale` (line 2288 via
   `propagate_fact_staleness`) — the crate-faithful incorporated-fact trigger.
 
 **Generator constraints (fail-states are NOT invariants).** Every F4 `strategy-id`
