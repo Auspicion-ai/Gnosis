@@ -1511,8 +1511,7 @@ pub trait RagStore: Send + Sync {
     /// mutation; side-effect-free; deterministic. Fail-state: `CommunityNotFound`
     /// **only** — a `communityId`-keyed accessor derives the wiki from the
     /// community record, so `WikiNotFound` cannot fire (matching `get_community`'s
-    /// FS-25). **RED-stage stub** — the body is `unimplemented!()`; the
-    /// Implementer lands the real pre-joined read to go green.
+    /// FS-25). GREEN — implemented as a pre-joined read (411 tests).
     fn get_community_context(
         &self,
         community_id: &CommunityId,
