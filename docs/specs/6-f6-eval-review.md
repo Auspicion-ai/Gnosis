@@ -4,7 +4,7 @@
 - **Gate:** proposal-review gate (validity ∥ critique → architecture → change-analysis).
 - **Date:** 2026-09-09.
 - **Verdict:** **PASS — RE-SCOPED, delegable** (contingent on the user's go-ahead). The as-stated F6 (audit-log-fed, faithfulness/relevancy, DeepEval-in-Rust) is **INVALID**; the re-scoped F6 is a valid, delegable Gnosis-repo unit.
-- **Status:** proposal approved by review (re-scoped); code/contract delegation awaits the user's go-ahead.
+- **Status:** proposal approved by review (re-scoped); **LANDED + GREEN (2026-09-09)** — the re-scoped F6 unit is implemented and trio-green (387 tests, clippy/fmt clean).
 
 ## What F6 is (as stated) and why it was re-scoped
 

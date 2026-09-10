@@ -1,16 +1,18 @@
 # §7.8 F6 — RAG evaluation harness (deterministic contextual precision/recall) — behavior contract
 
 - **Unit:** §7.8 F6 — RAG evaluation harness (SHOULD-HAVE dev/QA gate).
-- **Status:** **PLANNED-for-F6** — this is the behavior contract the F6 unit's
-  TestWriter derives its red set from. It pins the **pure deterministic metric
-  functions** + the **`gnosis-eval` `[[bin]]`** + the **labeled-corpus fixture** +
-  the **test-suite**. It is a **dev/QA gate, NOT a runtime contract element**:
-  ZERO runtime change, ZERO new runtime deps, ZERO change to any §4.3.4/§4.5/§4.6
-  surface.
+- **Status:** **LANDED + GREEN (2026-09-09)** — the F6 unit is implemented and
+  trio-green (**387 tests**, clippy/fmt clean). This is the behavior contract the
+  F6 unit's TestWriter derived its red set from. It pins the **pure deterministic
+  metric functions** + the **`gnosis-eval` `[[bin]]`** + the **labeled-corpus
+  fixture** + the **test-suite**. It is a **dev/QA gate, NOT a runtime contract
+  element**: ZERO runtime change, ZERO new runtime deps, ZERO change to any
+  §4.3.4/§4.5/§4.6 surface.
 - **Gate:** proposal-review **PASSED — RE-SCOPED** (`docs/specs/6-f6-eval-review.md`,
   decision `F6-EVAL-RE-SCOPED`). The as-stated F6 (audit-log-fed, faithfulness/
   relevancy, DeepEval-in-Rust) is **INVALID**; the re-scoped F6 is the approved,
-  delegable deliverable. Code/contract delegation awaits the user's go-ahead.
+  delegable deliverable. **LANDED + GREEN (2026-09-09)** — see the F6 DONE row in
+  `docs/next-steps.md`.
 - **Contract cross-refs:** `docs/specs/gnosis.md` §7.8 (the gap), §4.5.1 (query
   modes), §4.6.1 (`ragQuery` surface + `RagResult`), §4.3.4 (audit log — the
   harness does **NOT** use it); `docs/specs/6-f6-eval-review.md` (the verdict +
@@ -496,7 +498,8 @@ must **not** assert that `serde_json::from_str::<QueryMode>("\"flat\"")` succeed
 the audit log "supplies the raw material" is the red herring the re-scope removes;
 the corrected wording is that the harness **re-runs `rag_query` against a READY
 engine**. This spec pins that corrected wording; the §7.8/`docs/next-steps.md`/
-`docs/pending.md` reconciliation is a separate doc-review pass.
+`docs/pending.md` reconciliation was completed by the **2026-09-09 F6 doc-review
+pass** (`archive/reviews/2026-09-09-f6-eval-doc-review.md`).
 
 ---
 
