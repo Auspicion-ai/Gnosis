@@ -5,12 +5,14 @@
 //! seam. Contract: `docs/specs/engine-wire-contract.md` (GREEN — 360 tests).
 
 pub mod codecs;
+pub mod crud;
 pub mod decode;
 pub mod envelope;
 pub mod error;
 pub mod sse;
 pub mod status;
 
+pub use self::crud::{CrudMethod, CrudResponseError, CrudResult, CrudValidationFailure};
 pub use self::decode::{DecodeError, ValidationFailure};
 pub use self::envelope::Envelope;
 pub use self::status::HealthReport;

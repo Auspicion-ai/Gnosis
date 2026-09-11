@@ -17,6 +17,9 @@ sha2 = "0.10"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # futures for the SSE stream surface
 futures = "0.3"
+# §7.2 P2 — the axum server framework for the `gnosis-server` transport host
+# (scoped to the bin; the engine lib stays at zero new runtime deps).
+axum = "0.7"
 
 [dev-dependencies]
 # tokio test support
@@ -33,6 +36,12 @@ path = "src/main.rs"
 [[bin]]
 name = "gnosis-eval"
 path = "src/bin/gnosis_eval.rs"
+
+# §7.2 P2 — the `gnosis-server` transport host `[[bin]]` (the live HTTP/SSE
+# server). Depends on the engine lib + the axum server framework.
+[[bin]]
+name = "gnosis-server"
+path = "src/bin/gnosis_server.rs"
 
 [lib]
 name = "gnosis"

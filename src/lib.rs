@@ -12,11 +12,14 @@ pub mod consistency; // §4.4 consistency enforcement
 pub mod facts; // §4.3 fact/citation tracking
 pub mod graph; // §4.2 knowledge graph (subject-relation model, entity resolution)
 pub mod retrieval; // §4.5 RAG/agent-memory retrieval (query modes + vector fields)
+pub mod server; // §7.2 P2 — pure server-side mapping fns (status / decode-outcome / routing)
 pub mod store; // §4.1 document store (persistence, RAG store interface)
 pub mod wire; // §7.2 F2 engine wire contract (codecs + validate + SSE + health + envelope)
 
 // §7.2 F2 wire re-export surface (flat paths the shell / TestWriter reach).
 pub use self::wire::codecs;
+pub use self::wire::crud;
+pub use self::wire::crud::{CrudMethod, CrudResponseError, CrudResult, CrudValidationFailure};
 pub use self::wire::decode;
 pub use self::wire::decode::{DecodeError, ValidationFailure};
 pub use self::wire::envelope;
@@ -25,6 +28,10 @@ pub use self::wire::error; // crate-root `gnosis::error` (no collision exists)
 pub use self::wire::sse;
 pub use self::wire::status;
 pub use self::wire::status::HealthReport;
+
+// §7.2 P2 — the pure server-side mapping fns (re-exported so the TestWriter
+// reaches them as `gnosis::server_status` etc.).
+pub use self::server::{request_decode_status, route_bijection, server_status};
 
 // §4.5.3 retrieval-stack pure helpers (RRF fusion, §4.5.3 — k=60, EXACT rule).
 pub use self::retrieval::{rrf_fuse, RRF_K};

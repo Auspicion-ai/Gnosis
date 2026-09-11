@@ -22,6 +22,9 @@ pub enum DecodeError {
     InvalidEnvelope(String),
     /// error codec: no variant maps to this code.
     UnknownCode(String),
+    /// §7.2 P1a — a CRUD request `"method"` value that names no `CrudMethod`
+    /// variant (well-formed JSON, unrecognized method → transport 422).
+    UnknownMethod(String),
     /// SSE `event:` line != data `"type"`.
     EventTypeMismatch { event: String, data_type: String },
     /// a valid structural body failed validation.
