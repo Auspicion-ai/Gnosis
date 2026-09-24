@@ -25,6 +25,13 @@ pub use self::wire::decode::{DecodeError, ValidationFailure};
 pub use self::wire::envelope;
 pub use self::wire::envelope::Envelope;
 pub use self::wire::error; // crate-root `gnosis::error` (no collision exists)
+                           // §5.3 U2 — the shared `ragQuery` decode seam (LANDED; contract
+                           // `docs/specs/p2-gnosis-server.md` §5.3–§5.5).
+pub use self::wire::query::{
+    decode_query_request, encode_result_checked, request_decode_code, request_decode_message,
+    resolve_compression_mode, resolve_expand_mode, resolve_query_mode, QueryDecodeError, QueryPath,
+    SseParams,
+};
 pub use self::wire::sse;
 pub use self::wire::status;
 pub use self::wire::status::HealthReport;
@@ -32,6 +39,75 @@ pub use self::wire::status::HealthReport;
 // §7.2 P2 — the pure server-side mapping fns (re-exported so the TestWriter
 // reaches them as `gnosis::server_status` etc.).
 pub use self::server::{request_decode_status, route_bijection, server_status};
+
+// ---------------------------------------------------------------------------
+// §7.2 P2 §9.5.2 U3 — the boot-wiring seam (`P-IM-9`, strat:boot-flag-honesty).
+// ---------------------------------------------------------------------------
+//
+// **LANDED (U3).** The spec pins the lib-visible seam so the boot lifecycle's
+// flag obligation can be asserted without reaching the `[[bin]]` target:
+//
+// > `boot_wiring(provider: BootProvider, snapshot: &DerivedIndexes)
+// >      -> (EngineState, EngineSubsystems)`
+// > where `BootProvider ∈ {Absent, Unreachable, Reachable(Arc<dyn EmbeddingProvider>)}`
+//
+// Contract (docs/specs/p2-gnosis-server.md §9.5.2 `P-IM-9`, §9.5.4's coverage
+// note; docs/specs/engine-wire-contract.md §9.1):
+//   * `Absent`      ⇒ `(EngineState::Unavailable, …)`
+//   * `Unreachable` ⇒ `(EngineState::Degraded, …)`
+//   * `Reachable(_)`⇒ `(EngineState::Ready, …)`
+//   * in all three: `vector == snapshot.vectors.is_some()`, `store`/`graph`/
+//     `lexical` `true`, `reranker` `false`, `embedding == (a provider was wired)`;
+//   * **the second element is the DERIVED vector, not a mask the boot writes**
+//     (BLOCKING item 4 of the second remand): the boot applies **only** the
+//     returned `EngineState` plus its own wiring (`set_engine_state`,
+//     `swap_snapshot`, and `set_embedding_provider` only in the `Reachable`
+//     case) and **never** calls `set_subsystems`; the returned `EngineSubsystems`
+//     exists as the **assertion surface** that a lib test compares against the
+//     store's own independent derived read (`get_engine_status().subsystems`).
+
+/// §7.2 P2 §9.5.2 U3 — what the boot's provider probe found (`P-IM-9`).
+pub enum BootProvider {
+    /// No provider configured at all (no env var): the boot wires none.
+    Absent,
+    /// A provider is configured but its availability probe failed.
+    Unreachable,
+    /// A provider is configured and reachable: the boot wires it.
+    Reachable(std::sync::Arc<dyn EmbeddingProvider>),
+}
+
+/// §7.2 P2 §9.5.2 U3 — the boot's wiring, as a pure function of what was wired
+/// (`P-IM-9`): the returned `EngineState` is what the boot applies, and the
+/// returned `EngineSubsystems` is the **derived** flag vector (written nowhere —
+/// the assertion surface only).
+///
+/// A pure function of its two inputs: it consults **no** live network (the boot
+/// has already probed the provider) and derives the flags from the same three
+/// capability predicates `get_engine_status` uses (§9.5.2's flag table):
+/// `store`/`graph`/`lexical` always `true`, `reranker` always `false`,
+/// `vector == snapshot.vectors.is_some()`, and `embedding == (a provider was
+/// wired)` — i.e. `Reachable(_)` only.
+pub fn boot_wiring(
+    provider: BootProvider,
+    snapshot: &DerivedIndexes,
+) -> (EngineState, EngineSubsystems) {
+    let (state, embedding) = match provider {
+        BootProvider::Absent => (EngineState::Unavailable, false),
+        BootProvider::Unreachable => (EngineState::Degraded, false),
+        BootProvider::Reachable(_) => (EngineState::Ready, true),
+    };
+    (
+        state,
+        EngineSubsystems {
+            store: true,
+            graph: true,
+            lexical: true,
+            vector: snapshot.vectors.is_some(),
+            embedding,
+            reranker: false,
+        },
+    )
+}
 
 // §4.5.3 retrieval-stack pure helpers (RRF fusion, §4.5.3 — k=60, EXACT rule).
 pub use self::retrieval::{rrf_fuse, RRF_K};
@@ -41,17 +117,23 @@ pub use self::retrieval::{rrf_fuse, RRF_K};
 pub use self::retrieval::{contextual_precision, contextual_recall, mrr_at_k, ndcg_at_k};
 
 // §4.1 document-store public API surface (re-exported for the shell / tests).
+// `build_boot_vector_index` is §7.2 P2 §9.5.5 U5's boot index build: its **body**
+// lives in `src/store/`'s module (where `Store.shards`/`StoreShard.docs` are
+// visible, so no accessor or test hook is added) and only its **name** is
+// re-exported here — the F11 lib-seam precedent, exactly as `boot_wiring` is,
+// so the boot's `[[bin]]`-only path stays assertable from `tests/`.
 pub use self::store::{
-    Alias, BlockedBy, CandidateFact, Community, CommunityContext, CommunityId, CommunityState,
-    CompressionMode, ConsistencyReferenceReport, CreateDocumentRequest, DeclareCommunityOptions,
-    DerivedIndexes, DocState, Document, DocumentId, DocumentList, DocumentSummary, Edge, EdgeKind,
-    EmbeddingCache, EmbeddingProvider, EngineState, EngineStatus, EngineSubsystems, EntityPair,
-    ExpandMode, Fact, FactList, FieldType, FirstPassOptions, GetTriplesFilter, Graph,
-    GraphTraceStep, HybridTrace, LexicalIndex, ListDocumentsFilter, ListFactsFilter,
-    MergeFactsOptions, MultiQueryOptions, Node, NodeId, NodeKind, ProfileSummary, ProposalOutcome,
-    QueryAuditEntry, QueryAuditFilters, QueryMode, QueryTriplesOptions, RagChunk, RagParent,
-    RagQueryOptions, RagResult, RagResultItem, RagStore, RagStream, RagTrace, ReferenceState,
-    Rejection, ResolutionResult, ResolveEntitiesOptions, ResolveOptions, ResolvedFact, Source,
-    Store, StoreError, SubTaskDagOptions, TraceDescriptor, Triple, TripleDirection, TriplePattern,
-    UpdateDocumentRequest, UpdateFactRequest, VectorIndex, Wiki, WikiId,
+    build_boot_vector_index, Alias, BlockedBy, CandidateFact, Community, CommunityContext,
+    CommunityId, CommunityState, CompressionMode, ConsistencyReferenceReport,
+    CreateDocumentRequest, DeclareCommunityOptions, DerivedIndexes, DocState, Document, DocumentId,
+    DocumentList, DocumentSummary, Edge, EdgeKind, EmbeddingCache, EmbeddingProvider, EngineState,
+    EngineStatus, EngineSubsystems, EntityPair, ExpandMode, Fact, FactList, FieldType,
+    FirstPassOptions, GetTriplesFilter, Graph, GraphTraceStep, HybridTrace, LexicalIndex,
+    ListDocumentsFilter, ListFactsFilter, MergeFactsOptions, MultiQueryOptions, Node, NodeId,
+    NodeKind, ProfileSummary, ProposalOutcome, QueryAuditEntry, QueryAuditFilters, QueryMode,
+    QueryTriplesOptions, RagChunk, RagParent, RagQueryOptions, RagResult, RagResultItem, RagStore,
+    RagStream, RagTrace, ReferenceState, Rejection, ResolutionResult, ResolveEntitiesOptions,
+    ResolveOptions, ResolvedFact, Source, Store, StoreError, SubTaskDagOptions, TraceDescriptor,
+    Triple, TripleDirection, TriplePattern, UpdateDocumentRequest, UpdateFactRequest, VectorIndex,
+    Wiki, WikiId,
 };

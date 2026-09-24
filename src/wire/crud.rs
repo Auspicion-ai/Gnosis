@@ -1,10 +1,12 @@
 //! §7.2 P1a — Document-CRUD wire contract (`src/wire/crud.rs`).
 //!
 //! The 11 §4.1 document-CRUD request/response wire shapes + codecs + validation
-//! + endpoint constants. Extends the F2 wire layer (`docs/specs/engine-wire-contract.md`);
-//! every CRUD request/response is wrapped in the F2 `Envelope`
+//! + endpoint constants. Extends the F2 wire layer (`docs/specs/engine-wire-contract.md`).
+//!
+//! Every CRUD request/response is wrapped in the F2 `Envelope`
 //! (`CURRENT_SCHEMA_VERSION=1`, `idFormat:"opaque-string-v1"`). The serde-frozen
 //! store bodies are embedded verbatim ("body via serde, don't re-case").
+//!
 //! Contract: `docs/specs/p1a-document-crud-wire.md`.
 
 use serde::ser::SerializeMap;
@@ -151,19 +153,31 @@ impl Serialize for CrudRequestArgs {
                 map.serialize_entry("documentId", document_id)?;
                 map.serialize_entry("body", body)?;
             }
-            CrudRequestArgs::DeleteDocument { caller, document_id } => {
+            CrudRequestArgs::DeleteDocument {
+                caller,
+                document_id,
+            } => {
                 map.serialize_entry("caller", caller)?;
                 map.serialize_entry("documentId", document_id)?;
             }
-            CrudRequestArgs::PublishDocument { caller, document_id } => {
+            CrudRequestArgs::PublishDocument {
+                caller,
+                document_id,
+            } => {
                 map.serialize_entry("caller", caller)?;
                 map.serialize_entry("documentId", document_id)?;
             }
-            CrudRequestArgs::UnpublishDocument { caller, document_id } => {
+            CrudRequestArgs::UnpublishDocument {
+                caller,
+                document_id,
+            } => {
                 map.serialize_entry("caller", caller)?;
                 map.serialize_entry("documentId", document_id)?;
             }
-            CrudRequestArgs::ArchiveDocument { caller, document_id } => {
+            CrudRequestArgs::ArchiveDocument {
+                caller,
+                document_id,
+            } => {
                 map.serialize_entry("caller", caller)?;
                 map.serialize_entry("documentId", document_id)?;
             }
@@ -211,7 +225,10 @@ pub enum CrudValidationFailure {
     /// createDocument must yield revision == 0.
     UnexpectedRevision { expected: u64, actual: u64 },
     /// publish/unpublish/archive must yield the documented state.
-    UnexpectedState { expected: DocState, actual: DocState },
+    UnexpectedState {
+        expected: DocState,
+        actual: DocState,
+    },
     /// listDocuments must yield page >= 1, 1 <= page_size <= 100.
     InvalidPagination { page: u64, page_size: u64 },
     /// deleteDocument must yield void (null result).
@@ -430,9 +447,9 @@ pub fn encode_crud_error(method: CrudMethod, err: &StoreError) -> Envelope {
 /// (§4.3 / §10).
 pub fn decode_crud_response(env: &Envelope) -> Result<CrudResult, CrudResponseError> {
     if env.schema_version != CURRENT_SCHEMA_VERSION {
-        return Err(CrudResponseError::Decode(DecodeError::UnsupportedSchemaVersion(
-            env.schema_version,
-        )));
+        return Err(CrudResponseError::Decode(
+            DecodeError::UnsupportedSchemaVersion(env.schema_version),
+        ));
     }
     if env.id_format != ID_FORMAT_OPAQUE_STRING_V1 {
         return Err(CrudResponseError::Decode(DecodeError::UnknownIdFormat(
@@ -458,18 +475,14 @@ pub fn decode_crud_response(env: &Envelope) -> Result<CrudResult, CrudResponseEr
 
     // An `"error"` field carries the non-chunk codec body.
     if let Some(err) = payload.get("error") {
-        let code = err
-            .get("code")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                CrudResponseError::Decode(DecodeError::InvalidEnvelope(
-                    "CRUD error missing string \"code\"".to_string(),
-                ))
-            })?;
-        let message = err.get("message").and_then(|v| v.as_str());
-        let store_err = from_wire(code, message).ok_or_else(|| {
-            CrudResponseError::Decode(DecodeError::UnknownCode(code.to_string()))
+        let code = err.get("code").and_then(|v| v.as_str()).ok_or_else(|| {
+            CrudResponseError::Decode(DecodeError::InvalidEnvelope(
+                "CRUD error missing string \"code\"".to_string(),
+            ))
         })?;
+        let message = err.get("message").and_then(|v| v.as_str());
+        let store_err = from_wire(code, message)
+            .ok_or_else(|| CrudResponseError::Decode(DecodeError::UnknownCode(code.to_string())))?;
         return Err(CrudResponseError::Store(store_err));
     }
 
@@ -485,15 +498,10 @@ pub fn decode_crud_response(env: &Envelope) -> Result<CrudResult, CrudResponseEr
 
 fn decode_result(method: &CrudMethod, result: &Value) -> Result<CrudResult, CrudResponseError> {
     use CrudMethod::*;
-    let invalid = |e: serde_json::Error| {
-        CrudResponseError::Decode(DecodeError::InvalidJson(e.to_string()))
-    };
+    let invalid =
+        |e: serde_json::Error| CrudResponseError::Decode(DecodeError::InvalidJson(e.to_string()));
     match method {
-        CreateDocument
-        | GetDocument
-        | UpdateDocument
-        | PublishDocument
-        | UnpublishDocument
+        CreateDocument | GetDocument | UpdateDocument | PublishDocument | UnpublishDocument
         | ArchiveDocument => {
             let d: Document = serde_json::from_value(result.clone()).map_err(invalid)?;
             Ok(CrudResult::Document(d))
@@ -626,7 +634,10 @@ pub const ENGINE_ENDPOINTS: &[(&str, CrudMethod)] = &[
     ("POST /documents/:id/update", CrudMethod::UpdateDocument),
     ("DELETE /documents/:id", CrudMethod::DeleteDocument),
     ("POST /documents/:id/publish", CrudMethod::PublishDocument),
-    ("POST /documents/:id/unpublish", CrudMethod::UnpublishDocument),
+    (
+        "POST /documents/:id/unpublish",
+        CrudMethod::UnpublishDocument,
+    ),
     ("POST /documents/:id/archive", CrudMethod::ArchiveDocument),
     ("GET /documents", CrudMethod::ListDocuments),
     ("POST /wikis", CrudMethod::CreateWiki),

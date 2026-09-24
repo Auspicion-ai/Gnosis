@@ -31,8 +31,8 @@
 
 use gnosis::envelope::{Envelope, CURRENT_SCHEMA_VERSION, ID_FORMAT_OPAQUE_STRING_V1};
 use gnosis::wire::crud::{
-    encode_crud_error, encode_crud_request, encode_crud_response, decode_crud_request,
-    decode_crud_response, validate_crud_result, CrudMethod, CrudRequestArgs, CrudResponseError,
+    decode_crud_request, decode_crud_response, encode_crud_error, encode_crud_request,
+    encode_crud_response, validate_crud_result, CrudMethod, CrudRequestArgs, CrudResponseError,
     CrudResult, ENGINE_ENDPOINTS,
 };
 use gnosis::{
@@ -191,12 +191,7 @@ const CALLERS: &[&str] = &[
 ];
 
 /// Boundary opaque-id corpus.
-const IDS: &[&str] = &[
-    "",
-    "d1",
-    "550e8400-e29b-41d4-a716-446655440000",
-    "漢字",
-];
+const IDS: &[&str] = &["", "d1", "550e8400-e29b-41d4-a716-446655440000", "漢字"];
 
 /// Boundary title/name corpus (incl. a 200-char boundary string).
 fn titles() -> Vec<String> {
@@ -555,7 +550,7 @@ fn p_im_1_crud_request_roundtrip() {
     for _ in 0..B_IM1 {
         let m = rng.pick(&all_methods());
         let args = gen_args(&mut rng, &m);
-        let decoded = decode_crud_request(&encode_crud_request(m.clone(), args.clone()));
+        let decoded = decode_crud_request(&encode_crud_request(m, args.clone()));
         match decoded {
             Ok((dm, da)) if dm == m && da == args => {}
             Ok((dm, da)) => cexes.push(format!(
@@ -593,7 +588,7 @@ fn p_im_2_crud_response_roundtrip() {
     for _ in 0..B_IM2 {
         let m = rng.pick(&all_methods());
         let result = gen_result(&mut rng, &m);
-        let decoded = decode_crud_response(&encode_crud_response(m.clone(), result.clone()));
+        let decoded = decode_crud_response(&encode_crud_response(m, result.clone()));
         match decoded {
             Ok(dr) if dr == result => {}
             Ok(dr) => cexes.push(format!(
@@ -633,7 +628,7 @@ fn p_im_3_crud_error_roundtrip() {
     for _ in 0..B_IM3 {
         let m = rng.pick(&methods);
         let e = errors[rng.below(errors.len() as u64) as usize].clone();
-        let decoded = decode_crud_response(&encode_crud_error(m.clone(), &e));
+        let decoded = decode_crud_response(&encode_crud_error(m, &e));
         match decoded {
             Err(CrudResponseError::Store(e2)) if e2 == e => {}
             Err(CrudResponseError::Store(e2)) => cexes.push(format!(
@@ -705,8 +700,7 @@ fn p_im_4_crud_method_unique() {
                 if perm[i].method_str() == perm[j].method_str() {
                     cexes.push(format!(
                         "permutation collision {:?} == {:?}",
-                        perm[i],
-                        perm[j]
+                        perm[i], perm[j]
                     ));
                 }
             }
@@ -743,11 +737,11 @@ fn p_sm_1_crud_envelope_stable() {
     for _ in 0..B_SM1 {
         let m = rng.pick(&methods);
         let env = match rng.below(3) {
-            0 => encode_crud_request(m.clone(), gen_args(&mut rng, &m)),
-            1 => encode_crud_response(m.clone(), gen_result(&mut rng, &m)),
+            0 => encode_crud_request(m, gen_args(&mut rng, &m)),
+            1 => encode_crud_response(m, gen_result(&mut rng, &m)),
             _ => {
                 let e = errors[rng.below(errors.len() as u64) as usize].clone();
-                encode_crud_error(m.clone(), &e)
+                encode_crud_error(m, &e)
             }
         };
         if env.schema_version != CURRENT_SCHEMA_VERSION {
@@ -793,7 +787,7 @@ fn p_sm_2_crud_caller_preserved() {
         let m = rng.pick(&mutating_methods());
         let args = gen_args(&mut rng, &m);
         let expected = caller_of(&args).unwrap().to_string();
-        let decoded = decode_crud_request(&encode_crud_request(m.clone(), args.clone()));
+        let decoded = decode_crud_request(&encode_crud_request(m, args.clone()));
         match decoded {
             Ok((_, da)) => match caller_of(&da) {
                 Some(c) if c == expected => {}
@@ -807,7 +801,7 @@ fn p_sm_2_crud_caller_preserved() {
         // Read-only: no "caller" key in the encoded args object.
         let ro = rng.pick(&read_only_methods());
         let ro_args = gen_args(&mut rng, &ro);
-        let env = encode_crud_request(ro.clone(), ro_args);
+        let env = encode_crud_request(ro, ro_args);
         let args_obj = env.payload.get("args").and_then(|v| v.as_object());
         match args_obj {
             Some(obj) if obj.contains_key("caller") => {
@@ -840,7 +834,7 @@ fn p_sm_2_crud_caller_preserved() {
 // the 11 methods (pairwise-distinct paths, pairwise-distinct methods, 11 rows).
 #[test]
 fn p_sm_3_crud_endpoint_unique() {
-    let mut rng = Rng::seeded(row_seed(PSM3));
+    let _rng = Rng::seeded(row_seed(PSM3));
     let mut cases: u32 = 0;
     let mut cexes: Vec<String> = Vec::new();
     for _ in 0..B_SM3 {
@@ -863,7 +857,7 @@ fn p_sm_3_crud_endpoint_unique() {
                 cexes.push(format!("duplicate method {m:?}"));
             }
             paths.push(path);
-            methods.push(m.clone());
+            methods.push(*m);
         }
         // Bijection: every one of the 11 methods appears exactly once.
         for m in all_methods() {
@@ -905,11 +899,9 @@ fn p_tp_1_crud_encode_validates() {
         if let Err(e) = validate_crud_result(&m, &result) {
             cexes.push(format!("validate rejected encoder input {m:?}: {e:?}"));
         }
-        match decode_crud_response(&encode_crud_response(m.clone(), result.clone())) {
+        match decode_crud_response(&encode_crud_response(m, result.clone())) {
             Ok(_) => {}
-            Err(e) => cexes.push(format!(
-                "decoder rejected encoder output for {m:?}: {e:?}"
-            )),
+            Err(e) => cexes.push(format!("decoder rejected encoder output for {m:?}: {e:?}")),
         }
         cases += 1;
         if cexes.len() >= 5 {

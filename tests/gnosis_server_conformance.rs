@@ -21,9 +21,7 @@
 //! green, exposing these three pure fns (over the §11 map / the request-decode
 //! outcome / the 14-row routing table) plus the `caller` threading.
 
-use gnosis::wire::crud::{
-    encode_crud_request, CrudMethod, CrudRequestArgs, ENGINE_ENDPOINTS,
-};
+use gnosis::wire::crud::{encode_crud_request, CrudMethod, CrudRequestArgs, ENGINE_ENDPOINTS};
 use gnosis::wire::decode::DecodeError;
 use gnosis::{
     CreateDocumentRequest, DocState, DocumentId, Graph, ListDocumentsFilter, StoreError,
@@ -69,6 +67,7 @@ fn crud_reachable_errors() -> Vec<StoreError> {
 }
 
 /// The retrieval-trio reachable `StoreError` variants (§7.1).
+#[allow(dead_code)] // reference enumerator: documents the §7.1 retrieval-trio variant set.
 fn retrieval_trio_errors() -> Vec<StoreError> {
     vec![
         StoreError::EngineUnavailable,
@@ -194,15 +193,18 @@ fn server_status_maps_all_7_crud_reachable_variants() {
     let expected: Vec<(StoreError, u16, &str)> = vec![
         (StoreError::DocumentNotFound, 404, "not_found"),
         (StoreError::WikiNotFound, 404, "wiki_not_found"),
-        (StoreError::ValidationError("x".to_string()), 400, "validation_error"),
+        (
+            StoreError::ValidationError("x".to_string()),
+            400,
+            "validation_error",
+        ),
         (StoreError::ConflictError, 409, "conflict"),
         (StoreError::DocumentInUse, 409, "doc_in_use"),
         (StoreError::InvalidState, 409, "invalid_state"),
         (StoreError::UnresolvedReference, 422, "unresolved_reference"),
     ];
     for (e, status, code) in expected {
-        let got = server_status(&e)
-            .unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
+        let got = server_status(&e).unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
         assert_eq!(got.0, status, "status for {e:?}");
         assert_eq!(got.1, code, "wire code for {e:?}");
     }
@@ -225,8 +227,7 @@ fn server_status_maps_retrieval_trio_variants() {
         (StoreError::SubTaskDagFailed, 500),
     ];
     for (e, status) in expected {
-        let got = server_status(&e)
-            .unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
+        let got = server_status(&e).unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
         assert_eq!(got.0, status, "status for {e:?}");
     }
 }
@@ -248,8 +249,8 @@ fn server_status_is_total_over_crud_reachable() {
 #[test]
 fn server_status_wire_code_equals_storeerror_wire_code() {
     for e in crud_reachable_errors() {
-        let (_, code) = server_status(&e)
-            .unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
+        let (_, code) =
+            server_status(&e).unwrap_or_else(|| panic!("server_status({e:?}) must be Some"));
         assert_eq!(code, e.wire_code(), "wire-code fidelity for {e:?}");
     }
 }
@@ -287,7 +288,10 @@ fn request_decode_status_is_total_and_never_502() {
             got == 400 || got == 422,
             "request-decode status for {e:?} must be 400/422, got {got}"
         );
-        assert_ne!(got, 502, "request-decode status for {e:?} must never be 502");
+        assert_ne!(
+            got, 502,
+            "request-decode status for {e:?} must never be 502"
+        );
     }
 }
 
@@ -372,7 +376,10 @@ fn route_bijection_includes_retrieval_trio() {
     let table = route_bijection();
     let paths: Vec<&str> = table.iter().map(|(p, _)| *p).collect();
     for p in ["POST /rag/query", "GET /rag/stream", "GET /engine/status"] {
-        assert!(paths.contains(&p), "retrieval path {p} must be in the routing table");
+        assert!(
+            paths.contains(&p),
+            "retrieval path {p} must be in the routing table"
+        );
     }
 }
 
@@ -386,7 +393,7 @@ fn route_bijection_includes_retrieval_trio() {
 #[test]
 fn caller_present_on_7_mutating() {
     for m in mutating_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -407,7 +414,7 @@ fn caller_present_on_7_mutating() {
 #[test]
 fn caller_absent_on_4_read_only() {
     for m in read_only_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -431,7 +438,9 @@ fn caller_absent_on_4_read_only() {
 fn endpoint_create_document_fail_states() {
     assert_eq!(server_status(&StoreError::WikiNotFound).unwrap().0, 404);
     assert_eq!(
-        server_status(&StoreError::ValidationError("x".to_string())).unwrap().0,
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
         400
     );
 }
@@ -448,7 +457,9 @@ fn endpoint_get_document_fail_states() {
 fn endpoint_update_document_fail_states() {
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
     assert_eq!(
-        server_status(&StoreError::ValidationError("x".to_string())).unwrap().0,
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
         400
     );
     assert_eq!(server_status(&StoreError::ConflictError).unwrap().0, 409);
@@ -467,7 +478,10 @@ fn endpoint_delete_document_fail_states() {
 #[test]
 fn endpoint_publish_document_fail_states() {
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
-    assert_eq!(server_status(&StoreError::UnresolvedReference).unwrap().0, 422);
+    assert_eq!(
+        server_status(&StoreError::UnresolvedReference).unwrap().0,
+        422
+    );
 }
 
 /// §10 — `POST /documents/:id/unpublish` (unpublishDocument):
@@ -492,7 +506,9 @@ fn endpoint_archive_document_fail_states() {
 fn endpoint_list_documents_fail_states() {
     assert_eq!(server_status(&StoreError::WikiNotFound).unwrap().0, 404);
     assert_eq!(
-        server_status(&StoreError::ValidationError("x".to_string())).unwrap().0,
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
         400
     );
 }
@@ -501,7 +517,9 @@ fn endpoint_list_documents_fail_states() {
 #[test]
 fn endpoint_create_wiki_fail_states() {
     assert_eq!(
-        server_status(&StoreError::ValidationError("x".to_string())).unwrap().0,
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
         400
     );
 }
@@ -516,7 +534,10 @@ fn endpoint_get_wiki_fail_states() {
 /// `TraceUnavailable`→502.
 #[test]
 fn endpoint_rag_query_fail_states() {
-    assert_eq!(server_status(&StoreError::EngineUnavailable).unwrap().0, 503);
+    assert_eq!(
+        server_status(&StoreError::EngineUnavailable).unwrap().0,
+        503
+    );
     assert_eq!(server_status(&StoreError::EngineError).unwrap().0, 502);
     assert_eq!(server_status(&StoreError::TraceUnavailable).unwrap().0, 502);
 }

@@ -1633,8 +1633,12 @@ pub struct Store {
     /// `UNAVAILABLE`). `rag_query`/`rag_stream` honor `EngineUnavailable` when
     /// not `READY` (FS-8). Initialized `Unavailable`; the boot/§4.5 wiring sets it.
     engine_state: RwLock<EngineState>,
-    /// §4.6.1 — per-subsystem health feeding `getEngineStatus` + the
-    /// `DEGRADED`/`UNAVAILABLE` distinction.
+    /// §4.6.1 — **the per-subsystem health is OBSERVATIONALLY INERT after U3**
+    /// (retained as a compile-only test hook): `get_engine_status` derives the six
+    /// flags from store state at read time (§5.8, §9.5.2 F16) and **never reads
+    /// this value** — nothing in `src/` reads it, so a write here changes no
+    /// reported status, and the `DEGRADED`/`UNAVAILABLE` distinction comes from
+    /// `engine_state` + `last_error` alone.
     subsystems: RwLock<EngineSubsystems>,
     /// §4.3.4 — the engine-side **query audit log** (append-only). `rag_query`
     /// appends `QueryAuditEntry`s; `get_query_audit_log()` reads them.
@@ -1707,6 +1711,10 @@ impl Store {
             // up). The audit log starts empty.
             derived: RwLock::new(Arc::new(DerivedIndexes::default())),
             engine_state: RwLock::new(EngineState::Unavailable),
+            // §4.6.1 — the LEGACY hard-coded mask (all six `true`), read by
+            // NOTHING: U3 replaced it as the status producer with the read-time
+            // derivation in `get_engine_status`, so it is dead value, not flag
+            // truth — no unit may read it back.
             subsystems: RwLock::new(EngineSubsystems {
                 store: true,
                 graph: true,
@@ -1857,8 +1865,12 @@ impl Store {
         *self.engine_state.write().unwrap() = state;
     }
 
-    /// §4.6.1 test/boot hook — set the per-subsystem health feeding
-    /// `getEngineStatus`.
+    /// §4.6.1 test hook — **write-only, observationally inert after U3.** It does
+    /// NOT feed `getEngineStatus`: `get_engine_status` derives the six flags from
+    /// store state at read time (§5.8, §9.5.2 F16) and never reads this value, so
+    /// the write changes no reported status. Retained as a compile-only test hook
+    /// (the U3 rows assert the derived read is unchanged under an all-true and an
+    /// all-false mask).
     pub fn set_subsystems(&self, subsystems: EngineSubsystems) {
         *self.subsystems.write().unwrap() = subsystems;
     }
@@ -4179,9 +4191,37 @@ impl RagStore for Store {
     }
 
     async fn get_engine_status(&self) -> EngineStatus {
-        // §4.6.1 — surface the stored engine state + per-subsystem health.
+        // §4.6.1 — surface the stored engine state + the DERIVED per-subsystem
+        // capability flags (the only producer of the flags; see below).
         let state = *self.engine_state.read().unwrap();
-        let subsystems = self.subsystems.read().unwrap().clone();
+        // §5.8 / §9.5.2 (U3, F16) — the six flags are a READ-TIME projection of
+        // the store's own state under **capability semantics** (a flag is `true`
+        // iff that subsystem's full query-time capability is wired and
+        // functional for THIS store) — the derivation happens here, and here
+        // only: no mutator writes a mask, so the stored `subsystems` field
+        // (retained so the `set_subsystems` test hook keeps compiling) is NOT
+        // the value this read returns.
+        let subsystems = EngineSubsystems {
+            // The sharded store, the graph walk and the live shard-scan lexical
+            // leg ARE the engine ⇒ always functional (§9.5.2's flag table).
+            store: true,
+            graph: true,
+            lexical: true,
+            // `vector` ⇔ the CURRENT derived snapshot carries a vector index
+            // (post-U5 the boot builds one over the store's corpus for a
+            // `Reachable` provider — `build_boot_vector_index` — so a freshly
+            // booted reachable server reads `true`, an EMPTY index included,
+            // while an `Absent`/`Unreachable` boot or a failed build leaves the
+            // snapshot index-free ⇒ `false`).
+            vector: self.snapshot().vectors.is_some(),
+            // `embedding` ⇔ a query-surface provider is wired. This is the wired
+            // CAPABILITY, not live reachability — the `state`/`last_error` pair
+            // reports an unreachable provider (§9.5.2 P-IM-8).
+            embedding: self.embedding_provider().is_some(),
+            // No reranker implementation exists anywhere in `src/` ⇒ `false` in
+            // every reachable state (§5.8, §9.5.2).
+            reranker: false,
+        };
         EngineStatus {
             state,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -5291,6 +5331,86 @@ impl Store {
             CompressionMode::Extract | CompressionMode::Graph => results,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 P2 §9.5.5 U5 — the boot vector-index build (`P-IM-10`…`P-IM-15`,
+// `strat:boot-index-build`).
+// ---------------------------------------------------------------------------
+//
+// **The body lives in this module (pinned by §9.5.5's surface #1):** the corpus
+// walk reads `Store.shards` and `StoreShard.docs`, both module-private, so **no**
+// new accessor, `pub` field or test-visible corpus hook is added — only the
+// function's **name** is re-exported from `src/lib.rs` (the F11 lib-seam
+// precedent, exactly as `boot_wiring` is), so the boot lifecycle stays assertable
+// without reaching the `[[bin]]` target.
+//
+// Contract (§9.5.5's contract tables (1), (2) and (4)) — a total, three-valued
+// function of its two inputs:
+//   * `Ok(None)` ⇒ **no provider was supplied**: nothing is to be built (the boot
+//     keeps its index-free snapshot). This is **not** an error, and **no**
+//     `embed` call is made;
+//   * `Ok(Some(vi))` ⇒ a provider was supplied and **every** `embed` call
+//     succeeded, with `vi.entries`' keys **exactly** the corpus's embeddable
+//     `(documentId, nodeId, FieldType::Full)` triples (`entries` may be empty for
+//     an empty corpus — an empty index IS an index, never `None`);
+//   * `Err(StoreError::EmbeddingUnavailable)` ⇒ a provider was supplied and an
+//     `embed` call failed: the index under construction is discarded **whole**
+//     (atomicity — no partial index is ever returned or observable).
+//
+// The build **reads** the store and writes **nothing** to it: no `swap_snapshot`,
+// no journal entry, no `epoch` move, no provider wiring (only the caller installs
+// the composed `DerivedIndexes` through one swap). It consults **no** env var and
+// makes **no** availability probe of its own (the boot's probe already produced
+// the `BootProvider`). It is **full-field and node-level**: exactly one
+// `FieldType::Full` entry per embeddable node, and the `binary` field is
+// deliberately **not** built (the coarse first pass degrades to the full field
+// without error, so `vector:true` means the full-field dense leg is wired).
+pub async fn build_boot_vector_index(
+    store: &Store,
+    provider: Option<&Arc<dyn EmbeddingProvider>>,
+) -> Result<Option<VectorIndex>, StoreError> {
+    // (1) No provider ⇒ no index is to be built, and no `embed` call is made.
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+
+    // (2) The corpus: every node of every document in every shard (all wikis, all
+    // shards — no wiki filter; the leg wiki-scopes at read time), walked in a
+    // stable, input-derived order so the build never depends on `HashMap`
+    // iteration order, thread scheduling, the wall clock or random state. A node
+    // whose `value` is `None` contributes nothing — there is no text to embed,
+    // and that is not an error.
+    let mut corpus: Vec<(DocumentId, NodeId, String)> = Vec::new();
+    for shard in store.shards.iter() {
+        let guard = shard.read().unwrap();
+        for doc in guard.docs.values() {
+            for node in doc.graph.nodes.iter() {
+                if let Some(value) = &node.value {
+                    corpus.push((doc.document_id.clone(), node.node_id.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    corpus.sort_by(|a, b| {
+        (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str()))
+    });
+
+    // (3) Exactly one `embed` call per embeddable node, strictly sequential (no
+    // fan-out, no batching, no retry), carrying that node's own `value` verbatim
+    // — the provider's returned length is authoritative (no dimension is pinned
+    // and nothing is normalised or truncated). Any `Err` aborts the whole build:
+    // the local index is dropped and the only error returned is the EXISTING
+    // `EmbeddingUnavailable` (no new `StoreError` variant is invented).
+    let mut entries: HashMap<(DocumentId, NodeId, FieldType), Vec<f32>> = HashMap::new();
+    for (document_id, node_id, text) in corpus {
+        let vector = provider
+            .embed(&text)
+            .await
+            .map_err(|_| StoreError::EmbeddingUnavailable)?;
+        entries.insert((document_id, node_id, FieldType::Full), vector);
+    }
+    Ok(Some(VectorIndex { entries }))
 }
 
 /// §4.5.3 / §4.5.3a — cosine similarity over the shared prefix (handles the

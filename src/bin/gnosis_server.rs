@@ -17,7 +17,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -34,8 +34,9 @@ use gnosis::wire::envelope::Envelope;
 use gnosis::wire::sse::encode_event;
 use gnosis::wire::status::health;
 use gnosis::{
-    request_decode_status, server_status, DerivedIndexes, EmbeddingProvider, EngineState,
-    QueryMode, RagQueryOptions, RagStore, StoreError,
+    boot_wiring, build_boot_vector_index, decode_query_request, request_decode_status,
+    server_status, BootProvider, DerivedIndexes, EmbeddingProvider, QueryDecodeError, QueryPath,
+    RagStore, SseParams, StoreError,
 };
 
 type AppState = Arc<Store>;
@@ -55,14 +56,62 @@ fn parse_port() -> u16 {
 }
 
 /// Render a request-decode `DecodeError` as its transport status (400/422,
-/// never 502) with a plain body.
+/// never 502) with the §5.5 JSON body: `{"code","message"}`, no envelope
+/// wrapper, `Content-Type: application/json` exactly (F15). The ONE shared
+/// renderer for every route that can fail to decode a request (CRUD + query).
 fn decode_error_response(e: &DecodeError) -> Response {
     let status = request_decode_status(e).unwrap_or(400);
+    let body = serde_json::json!({
+        "code": gnosis::request_decode_code(e).unwrap_or("invalid_json"),
+        "message": gnosis::request_decode_message(e),
+    })
+    .to_string();
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-        "request decode failed",
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
     )
         .into_response()
+}
+
+/// Render the shared query decoder's outcome: a transport failure goes through
+/// the one shared decode-error renderer; a validation failure is the §11-mapped
+/// `ValidationError` (400 `validation_error`) as an error envelope (§5.4).
+fn query_decode_error_response(e: QueryDecodeError) -> Response {
+    match e {
+        QueryDecodeError::Transport(e) => decode_error_response(&e),
+        QueryDecodeError::Validation(e) => {
+            let (status, _) = server_status(&e).unwrap_or((500, ""));
+            let env = gnosis::wire::codecs::encode_error(&e);
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(env),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// §5.4 — the SSE half of the decode-error rendering: the pre-stream `mode`
+/// token failure is HTTP **400** (the §11 `validation_error` status) with the
+/// single F2 §4.4 `error` frame as the body — never an `error` frame under a
+/// 200, and never the POST shape. A transport failure has no SSE frame form, so
+/// it falls back to the shared JSON renderer.
+fn sse_decode_error_response(e: QueryDecodeError) -> Response {
+    match e {
+        QueryDecodeError::Transport(e) => decode_error_response(&e),
+        QueryDecodeError::Validation(e) => {
+            let (status, code) = server_status(&e).unwrap_or((500, ""));
+            let frame = encode_event(&gnosis::store::RagChunk::Error(e));
+            debug_assert_eq!(code, "validation_error");
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                frame,
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Dispatch a decoded CRUD request to the engine and render the response
@@ -81,7 +130,12 @@ async fn dispatch(store: Arc<Store>, method: CrudMethod, args: CrudRequestArgs) 
             .get_document(&document_id)
             .await
             .map(CrudResult::Document),
-        (UpdateDocument, CrudRequestArgs::UpdateDocument { document_id, body, .. }) => store
+        (
+            UpdateDocument,
+            CrudRequestArgs::UpdateDocument {
+                document_id, body, ..
+            },
+        ) => store
             .update_document(&document_id, body)
             .await
             .map(CrudResult::Document),
@@ -105,10 +159,9 @@ async fn dispatch(store: Arc<Store>, method: CrudMethod, args: CrudRequestArgs) 
             .list_documents(&wiki_id, &body)
             .await
             .map(CrudResult::DocumentList),
-        (CreateWiki, CrudRequestArgs::CreateWiki { name, .. }) => store
-            .create_wiki(&name)
-            .await
-            .map(CrudResult::Wiki),
+        (CreateWiki, CrudRequestArgs::CreateWiki { name, .. }) => {
+            store.create_wiki(&name).await.map(CrudResult::Wiki)
+        }
         (GetWiki, CrudRequestArgs::GetWiki { wiki_id }) => {
             store.get_wiki(&wiki_id).await.map(CrudResult::Wiki)
         }
@@ -150,22 +203,31 @@ async fn crud_handler(State(store): State<AppState>, body: String) -> Response {
 
 /// `POST /rag/query` — request envelope → `RagResult` response envelope (or the
 /// §11-mapped error envelope; a not-READY engine → `EngineUnavailable` → 503).
+/// The request options are read through the ONE shared query decoder (§5.3).
 async fn rag_query_handler(State(store): State<AppState>, body: String) -> Response {
     let env = match Envelope::from_json(&body) {
         Ok(env) => env,
         Err(e) => return decode_error_response(&e),
     };
-    let query = env
-        .payload
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    match store.rag_query(&query, &RagQueryOptions::default()).await {
-        Ok(res) => {
-            let env = gnosis::wire::codecs::encode_result(&res);
-            (StatusCode::OK, Json(env)).into_response()
-        }
+    let (query, options) = match decode_query_request(QueryPath::Post, &env, SseParams::default()) {
+        Ok(x) => x,
+        Err(e) => return query_decode_error_response(e),
+    };
+    match store.rag_query(&query, &options).await {
+        // The checked encoder never emits a body the result validator rejects
+        // (§5.3); a rejected result renders as `EngineError` → 502 (FS-9).
+        Ok(res) => match gnosis::encode_result_checked(&res) {
+            Ok(env) => (StatusCode::OK, Json(env)).into_response(),
+            Err(e) => {
+                let (status, _) = server_status(&e).unwrap_or((500, ""));
+                let env = gnosis::wire::codecs::encode_error(&e);
+                (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(env),
+                )
+                    .into_response()
+            }
+        },
         Err(e) => {
             let (status, _) = server_status(&e).unwrap_or((500, ""));
             let env = gnosis::wire::codecs::encode_error(&e);
@@ -185,17 +247,20 @@ async fn rag_stream_handler(
     State(store): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let query = params.get("query").cloned().unwrap_or_default();
-    let options = RagQueryOptions {
-        top_k: params.get("topK").and_then(|v| v.parse().ok()),
-        mode: params.get("mode").and_then(|m| match m.as_str() {
-            "flat" => Some(QueryMode::Flat),
-            "graph" => Some(QueryMode::Graph),
-            "vector" => Some(QueryMode::Vector),
-            "hybrid" => Some(QueryMode::Hybrid),
-            _ => None,
-        }),
-        ..Default::default()
+    // The SSE surface reads exactly `query`/`topK`/`mode` (§5.4's N1); the token
+    // is handed to the shared decoder as a param, never pre-resolved here.
+    let sse_params = SseParams {
+        query: params.get("query").map(String::as_str),
+        top_k: params.get("topK").map(String::as_str),
+        mode: params.get("mode").map(String::as_str),
+    };
+    let (query, options) = match decode_query_request(
+        QueryPath::Sse,
+        &Envelope::with_payload(serde_json::Value::Object(serde_json::Map::new())),
+        sse_params,
+    ) {
+        Ok(x) => x,
+        Err(e) => return sse_decode_error_response(e),
     };
     match store.rag_stream(&query, &options).await {
         Ok(stream) => {
@@ -206,11 +271,7 @@ async fn rag_stream_handler(
         }
         Err(e) => {
             let (status, _) = server_status(&e).unwrap_or((500, ""));
-            let frame = format!(
-                "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":\"{}\"}}\n\n",
-                e.wire_code(),
-                e
-            );
+            let frame = encode_event(&gnosis::store::RagChunk::Error(e));
             (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 frame,
@@ -318,19 +379,62 @@ impl EmbeddingProvider for OllamaProvider {
 async fn main() {
     let port = parse_port();
     let store = Arc::new(Store::new());
-    // §6 boot sequence: build the derived-indexes snapshot, wire the embedding
-    // provider, and transition to READY only when a provider is available. The
-    // server does NOT fabricate READY — without a wired provider the engine
-    // stays DEGRADED/UNAVAILABLE and `GET /engine/status` reflects that.
-    store.swap_snapshot(DerivedIndexes::default());
-    if let Some(provider) = OllamaProvider::from_env() {
-        if provider.is_available().await {
-            store.set_embedding_provider(Arc::new(provider));
-            store.set_engine_state(EngineState::Ready);
-        } else {
-            store.set_engine_state(EngineState::Degraded);
+    // §6 boot sequence + §9.5.2 (U3) + §9.5.5 (U5): probe the provider, build the
+    // `BootProvider`, then apply ONLY the `EngineState` `boot_wiring` returns,
+    // plus the boot's own wiring — the snapshot swap and, only in the
+    // `Reachable` case, `set_embedding_provider`. The returned flag vector is
+    // the DERIVED projection (an assertion surface), so it is NOT applied: the
+    // boot writes **no** flag mask, and `GET /engine/status` derives the honest
+    // vector from what was actually wired (no fabricated READY, and no
+    // `embedding:true` when no provider is wired).
+    let boot_snapshot = DerivedIndexes::default();
+    let (provider, wired): (BootProvider, Option<Arc<dyn EmbeddingProvider>>) =
+        match OllamaProvider::from_env() {
+            None => (BootProvider::Absent, None),
+            Some(probe) => {
+                if probe.is_available().await {
+                    let provider: Arc<dyn EmbeddingProvider> = Arc::new(probe);
+                    (BootProvider::Reachable(provider.clone()), Some(provider))
+                } else {
+                    (BootProvider::Unreachable, None)
+                }
+            }
+        };
+    // §9.5.5 (U5) — the boot index build. Built for a `Reachable` provider only
+    // (an `Absent`/`Unreachable` boot passes no provider, so **no** `embed` call
+    // is attempted and the index-free snapshot is kept unchanged), over the whole
+    // store's corpus, and composed into the snapshot from the returned
+    // `Option<VectorIndex>` alone — the rest of the boot snapshot is untouched:
+    //   * `Ok(Some(vi))` ⇒ an index-bearing snapshot (an empty index included);
+    //   * `Ok(None)`     ⇒ `vectors: None` (no provider: nothing to build);
+    //   * `Err(_)`       ⇒ the failed build's `Err` is discarded with the whole
+    //     local index; `built.ok().flatten()` leaves `vectors: None`.
+    // The provider was probed successfully, so it IS wired even on the failure
+    // branch — the one behavioural difference from the `Unreachable` branch.
+    let built = build_boot_vector_index(&store, wired.as_ref()).await;
+    let build_ok = built.is_ok();
+    let snapshot = DerivedIndexes {
+        vectors: built.ok().flatten(),
+        ..boot_snapshot
+    };
+    // A failed `Reachable` build degrades through the EXISTING
+    // `boot_wiring(BootProvider::Unreachable, &snapshot)`-shaped derived pair —
+    // no new branch, no new state — while the `Reachable` branch keeps `Ready`.
+    // The returned flag vector is discarded (the store derives its own at read
+    // time), so the failure branch writes **no** mask either.
+    let (state, _derived_flags) = match provider {
+        BootProvider::Reachable(reachable) if build_ok => {
+            boot_wiring(BootProvider::Reachable(reachable), &snapshot)
         }
+        BootProvider::Reachable(_) => boot_wiring(BootProvider::Unreachable, &snapshot),
+        BootProvider::Absent => boot_wiring(BootProvider::Absent, &snapshot),
+        BootProvider::Unreachable => boot_wiring(BootProvider::Unreachable, &snapshot),
+    };
+    store.swap_snapshot(snapshot);
+    if let Some(provider) = wired {
+        store.set_embedding_provider(provider);
     }
+    store.set_engine_state(state);
     let app = router(store);
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)

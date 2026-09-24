@@ -30,6 +30,14 @@ use gnosis::{
     HybridTrace, NodeId, QueryMode, RagChunk, RagResult, RagResultItem, RagTrace, ReferenceState,
     Source, StoreError, TraceDescriptor,
 };
+// §9.5.2 U3 additions (probe 6: the `boot_wiring`-vs-derived coupling).
+use gnosis::{
+    boot_wiring, BootProvider, DerivedIndexes, EmbeddingProvider, FieldType, RagStore, Store,
+    VectorIndex,
+};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Fixtures / helpers
@@ -697,6 +705,49 @@ fn all_true_subsystems() -> EngineSubsystems {
     }
 }
 
+/// §9.1 / §12 V-8.1 (U3, **amended by U5**) — the HONEST flag vector a READY
+/// engine reports under the capability semantics: `store`/`graph`/`lexical` true
+/// (always), `reranker` **false** in every reachable state (no reranker exists in
+/// `src/`), and `vector` **true** — the post-U5 value, because a `Reachable` boot
+/// now BUILDS the boot vector index and swaps an index-bearing snapshot
+/// (`docs/specs/p2-gnosis-server.md` §9.5.5's contract table (1), an EMPTY index
+/// included). The scope is the boot-build contract's `Reachable` + a snapshot
+/// whose `vectors` is `Some`: the rule that always holds is
+/// `subsystems.vector == snapshot().vectors.is_some()` (U5's `P-IM-14`), and
+/// V-8.1 is that rule's `Some` instance.
+fn honest_ready_subsystems() -> EngineSubsystems {
+    EngineSubsystems {
+        store: true,
+        graph: true,
+        lexical: true,
+        vector: true,
+        embedding: true,
+        reranker: false,
+    }
+}
+
+/// §9.1 / §12 V-8.2 (U3) — the HONEST flag vector a DEGRADED engine reports for
+/// the provider-**`Absent`**/**`Unreachable`** boot: no `embedding` claim, no
+/// index, no reranker.
+///
+/// **Scope (U5's reconciliation, per `docs/specs/p2-gnosis-server.md` §9.5.5's
+/// move table / `docs/specs/engine-wire-contract.md` §12's V-8.2 clause):** this
+/// fixture is the `Absent`/`Unreachable` instance only. U5's failed-`Reachable`-
+/// build branch is ALSO `Degraded` while it **wires** the provider — its honest
+/// mask is `vector:false`, `embedding:true`, `reranker:false` with the same fixed
+/// `lastError` — and that mask has no golden of its own (it is asserted at lib
+/// level by U5's `P-IM-15`).
+fn honest_degraded_subsystems() -> EngineSubsystems {
+    EngineSubsystems {
+        store: true,
+        graph: true,
+        lexical: true,
+        vector: false,
+        embedding: false,
+        reranker: false,
+    }
+}
+
 fn ready_status() -> EngineStatus {
     EngineStatus {
         state: EngineState::Ready,
@@ -1021,42 +1072,298 @@ fn v7_wire_code_samples_exact() {
     );
 }
 
-/// V-8 — health reports (canonical camelCase HealthReport JSON).
+/// V-8 / **V-8.1** / **V-8.2** — health reports (canonical camelCase
+/// `HealthReport` JSON) with the **amended (U3) literals**.
+///
+/// The pre-U1 fixtures asserted the all-`true` masks (`vector: true`,
+/// `reranker: true`) — the literals `docs/specs/engine-wire-contract.md` §12
+/// marks as **pre-U1 masks whose `vector`/`reranker` values are known-false
+/// claims** under §9.1's capability semantics. The golden edit lands **in the
+/// same unit as the flag change** (§5.8 / F2 §12's golden-literal discipline;
+/// U3), so this test now asserts:
+///
+/// * **V-8.1 (READY)** — `{store, graph, lexical, vector, embedding, reranker} =
+///   {true, true, true, false, true, false}`: the READY mask with `reranker`
+///   unconditionally `false` and `vector` `false` (the U3-stage variant — the
+///   boot index build that flips that one value is U5's, §9.5.2's `vector` note);
+/// * **V-8.2 (DEGRADED)** — `{…vector:false, embedding:false, reranker:false}`
+///   with the store's fixed `lastError` string unchanged (rewording it is not
+///   authorized).
+///
+/// V-8 is a **codec** vector: `health` is a faithful projection of whatever mask
+/// the fixture supplies — so the literals are exact projections of the fixtures
+/// below, and this test also pins that the DEGRADED `lastError` string is
+/// byte-identical to the store's (§12).
 #[test]
 fn v8_health_reports_exact() {
     let ready = EngineStatus {
         state: EngineState::Ready,
         version: "…".to_string(),
-        subsystems: all_true_subsystems(),
+        subsystems: honest_ready_subsystems(),
         last_error: None,
     };
     let ready_json =
         serde_json::to_string(&status::health(&ready)).expect("HealthReport is Serialize");
     assert_eq!(
         ready_json,
-        r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","state":"Ready","version":"…","subsystems":{"store":true,"graph":true,"lexical":true,"vector":true,"embedding":true,"reranker":true},"lastError":null}"#,
-        "V-8 ready report"
+        r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","state":"Ready","version":"…","subsystems":{"store":true,"graph":true,"lexical":true,"vector":true,"embedding":true,"reranker":false},"lastError":null}"#,
+        "V-8.1 ready report (U5 mask: a Reachable boot over a snapshot with an index ⇒ \
+         vector true, reranker false)"
     );
 
     let degraded = EngineStatus {
         state: EngineState::Degraded,
         version: "…".to_string(),
-        subsystems: EngineSubsystems {
-            store: true,
-            graph: true,
-            lexical: true,
-            vector: true,
-            embedding: false,
-            reranker: true,
-        },
+        subsystems: honest_degraded_subsystems(),
         last_error: Some("a non-core subsystem (embedding/reranker) is unavailable".to_string()),
     };
     let degraded_json =
         serde_json::to_string(&status::health(&degraded)).expect("HealthReport is Serialize");
     assert_eq!(
         degraded_json,
-        r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","state":"Degraded","version":"…","subsystems":{"store":true,"graph":true,"lexical":true,"vector":true,"embedding":false,"reranker":true},"lastError":"a non-core subsystem (embedding/reranker) is unavailable"}"#,
-        "V-8 degraded report"
+        r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","state":"Degraded","version":"…","subsystems":{"store":true,"graph":true,"lexical":true,"vector":false,"embedding":false,"reranker":false},"lastError":"a non-core subsystem (embedding/reranker) is unavailable"}"#,
+        "V-8.2 degraded report (amended U3 mask: no embedding claim, no index, no reranker)"
+    );
+}
+
+/// **Probe 6 (audit addition) — `boot_wiring_couples_to_the_derived_read`:** the
+/// V-8.1/V-8.2 literals cannot drift from the PRODUCER.
+///
+/// The `v8_health_reports_exact` golden above projects `honest_ready_subsystems()`
+/// / `honest_degraded_subsystems()` — fixtures, i.e. the TestWriter's hand-typed
+/// literals. `health` is a faithful projector, so that test pins the projection
+/// but says nothing about what the STORE actually derives. This test closes that
+/// seam: it applies the pinned wiring path (`boot_wiring`'s returned
+/// `EngineState` + its own snapshot swap, and the provider seam only in the
+/// `Reachable` case — never a `set_subsystems` mask write) to a real `Store` and
+/// asserts the store's own `get_engine_status().subsystems` **equals** the
+/// fixture — so a U5 change to the index build (or any flag-derivation
+/// regression) fails HERE, in the same file, instead of leaving the golden
+/// literals disagreeing with the producer.
+#[tokio::test]
+async fn boot_wiring_couples_to_the_derived_read() {
+    /// A deterministic in-memory provider: the seam's PRESENCE is what the
+    /// `embedding` flag tracks, so only constructibility matters here.
+    struct Provider {
+        available: bool,
+    }
+
+    impl EmbeddingProvider for Provider {
+        fn embed(
+            &self,
+            _text: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, StoreError>> + Send + '_>> {
+            let available = self.available;
+            Box::pin(async move {
+                if available {
+                    Ok(vec![0.0, 1.0])
+                } else {
+                    Err(StoreError::EmbeddingUnavailable)
+                }
+            })
+        }
+        fn is_available(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            let available = self.available;
+            Box::pin(async move { available })
+        }
+    }
+
+    /// A boot snapshot: traceless (`ready_vectors == false` — the
+    /// `Absent`/`Unreachable` shape and every non-boot-constructed store), or
+    /// index-bearing (`ready_vectors == true` — the post-U5 `Reachable` boot
+    /// shape, which the amended V-8.1 fixture projects).
+    fn boot_snapshot(ready_vectors: bool) -> DerivedIndexes {
+        let mut snapshot = DerivedIndexes::default();
+        if ready_vectors {
+            let mut vi = VectorIndex::default();
+            vi.entries.insert(
+                (
+                    DocumentId("d1".to_string()),
+                    NodeId("n1".to_string()),
+                    FieldType::Full,
+                ),
+                vec![1.0, 0.0],
+            );
+            snapshot.vectors = Some(vi);
+        }
+        snapshot
+    }
+
+    /// Apply the pinned wiring path (never a mask write) and read the store.
+    async fn derived_read(
+        provider: BootProvider,
+        wired: Option<Arc<dyn EmbeddingProvider>>,
+        snapshot: DerivedIndexes,
+    ) -> EngineSubsystems {
+        let (state, _flags) = boot_wiring(provider, &snapshot);
+        let store = Store::new();
+        store.swap_snapshot(snapshot);
+        if let Some(p) = wired {
+            store.set_embedding_provider(p);
+        }
+        store.set_engine_state(state);
+        store.get_engine_status().await.subsystems
+    }
+
+    // (1) V-8.1's producer: a REACHABLE provider is wired ⇒ `Ready` with an index
+    // (the post-U5 boot shape the amended fixture projects).
+    let reached = derived_read(
+        BootProvider::Reachable(Arc::new(Provider { available: true })),
+        Some(Arc::new(Provider { available: true })),
+        boot_snapshot(true),
+    )
+    .await;
+    assert_eq!(
+        reached,
+        honest_ready_subsystems(),
+        "V-8.1's literal must equal what the pinned wiring path actually derives"
+    );
+    assert!(
+        reached.embedding && reached.vector && !reached.reranker,
+        "the honest READY vector is the post-U5 `embedding:true` with an index and no \
+         reranker: {reached:?}"
+    );
+
+    // (2) V-8.2's producer: no provider at all ⇒ no `embedding` claim.
+    let absent = derived_read(BootProvider::Absent, None, boot_snapshot(false)).await;
+    assert_eq!(
+        absent,
+        honest_degraded_subsystems(),
+        "V-8.2's literal must equal what the provider-absent wiring actually derives"
+    );
+    // (3) …and the CONFIGURED-but-UNREACHABLE boot derives the same honest
+    // vector (the boot wires no provider in that branch), so the two boot
+    // outcomes of §9.5.2's table agree with one literal.
+    let unreachable = derived_read(BootProvider::Unreachable, None, boot_snapshot(false)).await;
+    assert_eq!(
+        unreachable,
+        honest_degraded_subsystems(),
+        "the Unreachable boot branch must derive the same honest vector as Absent"
+    );
+
+    // (4) the post-U5 shape (an index is wired): `vector` is `true` and nothing
+    // else moves — the one-value edit §12 promised for U5, now the fixture's own
+    // value, so this probe pins the same shape probe (1) exercises.
+    let u5 = derived_read(
+        BootProvider::Reachable(Arc::new(Provider { available: true })),
+        Some(Arc::new(Provider { available: true })),
+        boot_snapshot(true),
+    )
+    .await;
+    let u5_expected = honest_ready_subsystems();
+    assert_eq!(
+        u5, u5_expected,
+        "wiring a vector index must flip `vector` alone (the U5-time V-8.1 shape)"
+    );
+}
+
+/// **`health_report_shape_frozen`** (§9.5.2 `P-SM-6`'s moved-out half, F12; F2
+/// §9.1's F7 rule) — the frozen six-flag shape of `EngineSubsystems` and the
+/// frozen top-level key set of `HealthReport`.
+///
+/// This is an **acceptance/frozen-type criterion**, not a falsifiable property
+/// (a generator can only sample values that already exist), which is why it
+/// lives at the **conformance layer** rather than as a U3 property row. It
+/// asserts, for the health projection of a status:
+///
+/// * the **compile-time** field accesses — all six `EngineSubsystems` fields
+///   exist and are `bool` (a removed, re-typed or added *required* field fails
+///   compilation, and the `false`/`true` literals below fail the type check if a
+///   field is re-typed);
+/// * `serde_json::to_value(&subsystems)` yields **exactly** the six keys —
+///   `store`/`graph`/`lexical`/`vector`/`embedding`/`reranker` — none added, none
+///   lost, each a JSON boolean (a re-typed field serializes as a non-bool);
+/// * the `HealthReport` top level carries **exactly**
+///   `{schemaVersion, idFormat, state, version, subsystems, lastError}` — U3 adds
+///   **no** additive `HealthReport` field (F12: the F2 §9.1 additive permission
+///   stays unused), so the key set is byte-pinned here as well.
+#[test]
+fn health_report_shape_frozen() {
+    // (1) the six flags are booleans AT COMPILE TIME (a re-typed field breaks
+    // this literal; a removed one breaks the struct literal).
+    let s = EngineSubsystems {
+        store: false,
+        graph: true,
+        lexical: false,
+        vector: true,
+        embedding: false,
+        reranker: true,
+    };
+    let _: bool = s.store;
+    let _: bool = s.graph;
+    let _: bool = s.lexical;
+    let _: bool = s.vector;
+    let _: bool = s.embedding;
+    let _: bool = s.reranker;
+
+    // (2) the serialized flag object has EXACTLY those six keys, all booleans.
+    let flags = serde_json::to_value(&s).expect("EngineSubsystems is Serialize");
+    let obj = flags
+        .as_object()
+        .expect("the subsystems flags serialize to a JSON object");
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "embedding",
+            "graph",
+            "lexical",
+            "reranker",
+            "store",
+            "vector"
+        ],
+        "EngineSubsystems is FROZEN: exactly these six keys, none added/lost"
+    );
+    for (k, v) in obj.iter() {
+        assert!(
+            v.is_boolean(),
+            "flag {k:?} must stay a JSON boolean (re-typed to {v})"
+        );
+    }
+
+    // (3) the HealthReport top-level key set is frozen too (U3 adds no additive
+    // field: the F2 §9.1 permission stays unused — F12).
+    let status_in = EngineStatus {
+        state: EngineState::Degraded,
+        version: "0.1.0".to_string(),
+        subsystems: honest_degraded_subsystems(),
+        last_error: None,
+    };
+    let report = serde_json::to_value(status::health(&status_in)).expect("HealthReport Serialize");
+    let report_obj = report.as_object().expect("HealthReport is a JSON object");
+    let mut report_keys: Vec<&str> = report_obj.keys().map(|k| k.as_str()).collect();
+    report_keys.sort_unstable();
+    assert_eq!(
+        report_keys,
+        vec![
+            "idFormat",
+            "lastError",
+            "schemaVersion",
+            "state",
+            "subsystems",
+            "version"
+        ],
+        "HealthReport carries exactly its pinned camelCase top-level keys — U3 adds no field"
+    );
+    // The nested flags keep their single-word names (unchanged by the top-level
+    // camelCase rename) and the frozen six-key shape.
+    let nested = report_obj["subsystems"]
+        .as_object()
+        .expect("health.subsystems is a JSON object");
+    let mut nested_keys: Vec<&str> = nested.keys().map(|k| k.as_str()).collect();
+    nested_keys.sort_unstable();
+    assert_eq!(
+        nested_keys,
+        vec![
+            "embedding",
+            "graph",
+            "lexical",
+            "reranker",
+            "store",
+            "vector"
+        ],
+        "the health report's subsystems flags carry exactly the six frozen keys"
     );
 }
 
@@ -1358,4 +1665,146 @@ fn probe_done_chunk_strictness_via_sse_path() {
         sse::decode_event("event: done\ndata: {\"type\":\"done\"}\n\n"),
         Ok(RagChunk::Done)
     );
+}
+
+// ---------------------------------------------------------------------------
+// §12 V-15 / V-15.1 (U2) — the transport request-decode error body, byte-exact.
+// ---------------------------------------------------------------------------
+
+/// The canonical non-envelope transport decode-error body (§4.3 / §7.1):
+/// exactly two keys, `code` first then `message`, no envelope wrapper.
+fn v15_body(code: &str, message: &str) -> String {
+    serde_json::json!({"code": code, "message": message}).to_string()
+}
+
+/// **V-15 (both bodies) + V-15.1 (the query-path body).**
+///
+/// The rendered body is `{"code":"<transport code>","message":"<detail>"}` with
+/// `Content-Type: application/json` exactly (no `charset`) — the header and the
+/// live bytes are asserted by the e2e layer against the real transport, since
+/// this file has no HTTP client. Here the *bytes* are pinned AND the expected
+/// bytes are derived from the mapping under test (`request_decode_code` /
+/// `request_decode_message`), so the golden is red until the code/status mapping
+/// lands (§9.5.1 `P-TP-3`'s F8 split). For `invalid_json` only the code, the
+/// key set/order and the code's presence in the body are asserted: the carried
+/// string is serde's own parse text, NOT a contract token.
+#[test]
+fn v15_request_decode_error_body_exact() {
+    // (variant, the V-15/V-15.1 code, the transport status, the byte-exact body)
+    let cases = vec![
+        (
+            DecodeError::UnknownMethod("bogus".to_string()),
+            "unknown_method",
+            422u16,
+            r#"{"code":"unknown_method","message":"bogus"}"#,
+        ),
+        (
+            DecodeError::UnknownMethod(String::new()),
+            "unknown_method",
+            422,
+            r#"{"code":"unknown_method","message":""}"#,
+        ),
+        (
+            DecodeError::UnsupportedSchemaVersion(99),
+            "unsupported_schema_version",
+            400,
+            r#"{"code":"unsupported_schema_version","message":"unsupported schemaVersion: 99"}"#,
+        ),
+        (
+            DecodeError::InvalidEnvelope("envelope payload must be a JSON object".to_string()),
+            "invalid_envelope",
+            400,
+            r#"{"code":"invalid_envelope","message":"envelope payload must be a JSON object"}"#,
+        ),
+        (
+            DecodeError::UnknownIdFormat("uuid-v4".to_string()),
+            "unknown_id_format",
+            400,
+            r#"{"code":"unknown_id_format","message":"uuid-v4"}"#,
+        ),
+    ];
+
+    for (e, want_code, want_status, want_body) in &cases {
+        // The code/status mapping (P-TP-3's pure half) — the body is built from
+        // the mapping under test, so both halves go red together.
+        assert_eq!(
+            gnosis::request_decode_code(e),
+            Some(*want_code),
+            "transport code for {e:?}"
+        );
+        assert_eq!(
+            gnosis::request_decode_status(e),
+            Some(*want_status),
+            "transport status for {e:?}"
+        );
+        assert!(
+            !want_code.is_empty(),
+            "the transport code must be non-empty"
+        );
+        assert_ne!(*want_status, 502, "a transport status is never 502");
+        let body = v15_body(
+            gnosis::request_decode_code(e).expect("code"),
+            &gnosis::request_decode_message(e),
+        );
+        assert_eq!(body, *want_body, "V-15/V-15.1 byte-exact body for {e:?}");
+    }
+
+    // V-15's second body, byte-exact against the literal (the one variant whose
+    // message is guaranteed non-empty).
+    assert_eq!(
+        v15_body(
+            "unsupported_schema_version",
+            &gnosis::request_decode_message(&DecodeError::UnsupportedSchemaVersion(99))
+        ),
+        r#"{"code":"unsupported_schema_version","message":"unsupported schemaVersion: 99"}"#,
+        "V-15 unsupported_schema_version body"
+    );
+
+    // V-15.1's body, byte-exact against the literal (F9: `invalid_envelope`
+    // ALONE — `InvalidJson` is unreachable on the non-object-payload path).
+    assert_eq!(
+        v15_body(
+            "invalid_envelope",
+            &gnosis::request_decode_message(&DecodeError::InvalidEnvelope(
+                "envelope payload must be a JSON object".to_string()
+            ))
+        ),
+        r#"{"code":"invalid_envelope","message":"envelope payload must be a JSON object"}"#,
+        "V-15.1 query-path non-object-payload body"
+    );
+
+    // `invalid_json`: the code + the key set/order, never the serde message text.
+    let invalid_json = DecodeError::InvalidJson("bad json".to_string());
+    assert_eq!(
+        gnosis::request_decode_code(&invalid_json),
+        Some("invalid_json")
+    );
+    assert_eq!(gnosis::request_decode_status(&invalid_json), Some(400));
+    let body = v15_body(
+        gnosis::request_decode_code(&invalid_json).expect("code"),
+        &gnosis::request_decode_message(&invalid_json),
+    );
+    assert!(
+        body.starts_with(r#"{"code":"invalid_json","message":"#),
+        "body must open with the pinned key set/order: {body}"
+    );
+    assert!(
+        body.ends_with(r#""}"#),
+        "body must close with the (verbatim, possibly empty) message: {body}"
+    );
+
+    // §5.5's disjointness: no transport code is a §11 code.
+    for code in [
+        "invalid_json",
+        "invalid_envelope",
+        "unsupported_schema_version",
+        "unknown_id_format",
+        "unknown_method",
+    ] {
+        assert_eq!(
+            from_wire(code, Some("m")),
+            None,
+            "transport code {code} must not exist in the §11 map"
+        );
+    }
 }

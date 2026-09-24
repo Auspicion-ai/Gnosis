@@ -37,6 +37,7 @@ fn wid(id: &str) -> WikiId {
 }
 
 /// The 7 CRUD-reachable `StoreError` variants (§7.1 / P1a §6.1).
+#[allow(dead_code)] // reference enumerator: documents the §7.1 CRUD-reachable variant set.
 fn crud_reachable_errors() -> Vec<StoreError> {
     vec![
         StoreError::DocumentNotFound,
@@ -50,6 +51,7 @@ fn crud_reachable_errors() -> Vec<StoreError> {
 }
 
 /// The 5 request-decode `DecodeError` variants (§7.2 / P1a §6.2).
+#[allow(dead_code)] // reference enumerator: documents the §7.2 decode-variant error set.
 fn decode_error_variants() -> Vec<DecodeError> {
     vec![
         DecodeError::InvalidJson("bad json".to_string()),
@@ -154,11 +156,70 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
+/// Spawn the server with the **inherited** environment and wait until
+/// `GET /engine/status` answers.
+///
+/// **Ambient-provider spawner (H4).** This spawner INHERITS the environment, so
+/// on a machine whose `GNOSIS_SERVER_OLLAMA_URL` points at a reachable Ollama the
+/// boot takes the provider-REACHABLE branch and the engine comes up `Ready`. That
+/// outcome is **the live-scenario battery's named row `R-L2`**
+/// (`docs/specs/p2-gnosis-server-live-pending-battery.md` §3.5 — the home of the
+/// U3 register row `P-IM-9`'s provider-reachable live half) and is deliberately
+/// **not** asserted here. This spawner is therefore only for the rows whose
+/// subject is **not** the readiness precondition — the loopback bind, the status
+/// surface, and the CRUD round-trips, which are green in either readiness state.
+/// A row that needs the not-READY precondition MUST use
+/// `spawn_server_without_provider()` so the precondition is deterministic rather
+/// than ambient.
 async fn spawn_server() -> (Child, String) {
     let port = free_port();
+    // The child is intentionally kept live for the test and reaped via
+    // `ServerGuard`'s Drop (kill + wait), so no zombie is left.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(SERVER_BIN)
         .arg("--port")
         .arg(port.to_string())
+        .spawn()
+        .expect("spawn gnosis-server");
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if let Ok(resp) = client
+            .get(format!("{base}/engine/status"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                return (child, base);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("gnosis-server did not become ready on {base}");
+}
+
+/// Spawn the server with the boot's provider configuration **removed**, so the
+/// boot takes the provider-ABSENT branch (`BootProvider::Absent`) regardless of
+/// the ambient environment, and wait until `GET /engine/status` answers.
+///
+/// This is the hermetic spawner for every row whose precondition is the
+/// **not-READY** engine (§6: "the server does NOT fabricate READY"; §9 e2e: a
+/// `rag_query` while not READY ⇒ `EngineUnavailable` ⇒ 503). With no provider
+/// configured the boot wires none and leaves the construction state
+/// `EngineState::Unavailable` (p2 §9.5.2's boot-outcome table / adjudication
+/// note 2), so the deterministic honest flag vector is
+/// `{store:true, graph:true, lexical:true, vector:false, embedding:false,
+/// reranker:false}`. The provider-REACHABLE live outcome belongs to the live
+/// battery's row `R-L2` (see `spawn_server()` above), never to this set.
+async fn spawn_server_without_provider() -> (Child, String) {
+    let port = free_port();
+    #[allow(clippy::zombie_processes)]
+    let child = Command::new(SERVER_BIN)
+        .arg("--port")
+        .arg(port.to_string())
+        .env_remove("GNOSIS_SERVER_OLLAMA_URL")
+        .env_remove("GNOSIS_SERVER_OLLAMA_MODEL")
         .spawn()
         .expect("spawn gnosis-server");
     let base = format!("http://127.0.0.1:{port}");
@@ -198,7 +259,11 @@ async fn s1_loopback_bind_serves() {
         .send()
         .await
         .expect("GET /engine/status");
-    assert_eq!(resp.status().as_u16(), 200, "S1: loopback server must serve");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S1: loopback server must serve"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -208,14 +273,21 @@ async fn s1_loopback_bind_serves() {
 #[test]
 fn s2_route_bijection_14_rows() {
     let table = route_bijection();
-    assert_eq!(table.len(), 14, "S2: exactly 14 rows (11 CRUD + 3 retrieval)");
+    assert_eq!(
+        table.len(),
+        14,
+        "S2: exactly 14 rows (11 CRUD + 3 retrieval)"
+    );
     let mut paths: Vec<&str> = Vec::new();
     let mut handlers: Vec<&str> = Vec::new();
     for (path, handler) in table {
         assert!(!path.is_empty(), "S2: path non-empty");
         assert!(!handler.is_empty(), "S2: handler non-empty");
         assert!(!paths.contains(path), "S2: path {path} duplicated");
-        assert!(!handlers.contains(handler), "S2: handler {handler} duplicated");
+        assert!(
+            !handlers.contains(handler),
+            "S2: handler {handler} duplicated"
+        );
         paths.push(path);
         handlers.push(handler);
     }
@@ -261,7 +333,10 @@ async fn s4_engine_status_health_report() {
     assert_eq!(resp.status().as_u16(), 200, "S4: engine/status always 200");
     let text = resp.text().await.expect("status body");
     let report: serde_json::Value = serde_json::from_str(&text).expect("status is JSON");
-    assert!(report.get("state").is_some(), "S4: HealthReport carries state");
+    assert!(
+        report.get("state").is_some(),
+        "S4: HealthReport carries state"
+    );
     assert!(
         report.get("subsystems").is_some(),
         "S4: HealthReport carries subsystems"
@@ -277,15 +352,19 @@ fn s5_crud_reachable_status_mapping() {
     let expected: Vec<(StoreError, u16, &str)> = vec![
         (StoreError::DocumentNotFound, 404, "not_found"),
         (StoreError::WikiNotFound, 404, "wiki_not_found"),
-        (StoreError::ValidationError("x".to_string()), 400, "validation_error"),
+        (
+            StoreError::ValidationError("x".to_string()),
+            400,
+            "validation_error",
+        ),
         (StoreError::ConflictError, 409, "conflict"),
         (StoreError::DocumentInUse, 409, "doc_in_use"),
         (StoreError::InvalidState, 409, "invalid_state"),
         (StoreError::UnresolvedReference, 422, "unresolved_reference"),
     ];
     for (e, status, code) in expected {
-        let got = server_status(&e)
-            .unwrap_or_else(|| panic!("S5: server_status({e:?}) must be Some"));
+        let got =
+            server_status(&e).unwrap_or_else(|| panic!("S5: server_status({e:?}) must be Some"));
         assert_eq!(got.0, status, "S5: status for {e:?}");
         assert_eq!(got.1, code, "S5: wire code for {e:?}");
     }
@@ -311,8 +390,8 @@ fn s6_retrieval_trio_status_mapping() {
         (StoreError::SubTaskDagFailed, 500),
     ];
     for (e, status) in expected {
-        let got = server_status(&e)
-            .unwrap_or_else(|| panic!("S6: server_status({e:?}) must be Some"));
+        let got =
+            server_status(&e).unwrap_or_else(|| panic!("S6: server_status({e:?}) must be Some"));
         assert_eq!(got.0, status, "S6: status for {e:?}");
     }
 }
@@ -346,7 +425,7 @@ fn s7_request_decode_status_mapping() {
 fn s8_caller_threading() {
     // Mutating: the encoded envelope carries a string caller on args.
     for m in mutating_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -363,7 +442,7 @@ fn s8_caller_threading() {
     }
     // Read-only: the encoded envelope carries no caller on args.
     for m in read_only_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -376,7 +455,7 @@ fn s8_caller_threading() {
     }
     // Decode layer: a mutating request with the caller removed is rejected (400).
     for m in mutating_methods() {
-        let mut env = encode_crud_request(m.clone(), args_for(&m));
+        let mut env = encode_crud_request(m, args_for(&m));
         if let Some(args_obj) = env.payload.get_mut("args").and_then(|v| v.as_object_mut()) {
             args_obj.remove("caller");
         }
@@ -386,8 +465,12 @@ fn s8_caller_threading() {
         );
     }
     // Decode layer: a read-only request with an added caller is tolerated.
-    for m in [CrudMethod::GetDocument, CrudMethod::ListDocuments, CrudMethod::GetWiki] {
-        let mut env = encode_crud_request(m.clone(), args_for(&m));
+    for m in [
+        CrudMethod::GetDocument,
+        CrudMethod::ListDocuments,
+        CrudMethod::GetWiki,
+    ] {
+        let mut env = encode_crud_request(m, args_for(&m));
         if let Some(args_obj) = env.payload.get_mut("args").and_then(|v| v.as_object_mut()) {
             args_obj.insert("caller".to_string(), serde_json::json!("user:alice"));
         }
@@ -402,9 +485,20 @@ fn s8_caller_threading() {
 // S9 — §9 e2e: rag_query while not READY → EngineUnavailable → 503.
 // ---------------------------------------------------------------------------
 
+/// S9 — §9 e2e: `rag_query` while not READY → `EngineUnavailable` → 503.
+///
+/// **Precondition is the not-READY boot, so this row uses the hermetic
+/// provider-removed spawner** (§6: the server does NOT fabricate READY; §9: a
+/// `rag_query` while not READY ⇒ `EngineUnavailable` ⇒ 503). Inheriting the
+/// environment here would make the row ambient-dependent: an operator shell with
+/// `GNOSIS_SERVER_OLLAMA_URL` pointing at a reachable Ollama boots `Ready` and
+/// the query legitimately succeeds (200) — that is the live battery's row `R-L2`
+/// (`docs/specs/p2-gnosis-server-live-pending-battery.md` §3.5), which is not
+/// this row's claim. The assertion below is unchanged; only the precondition is
+/// made deterministic.
 #[tokio::test]
 async fn s9_rag_query_not_ready_503() {
-    let (child, base) = spawn_server().await;
+    let (child, base) = spawn_server_without_provider().await;
     let _guard = ServerGuard(child);
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -476,7 +570,11 @@ async fn s10_create_document_roundtrip() {
         .send()
         .await
         .expect("POST /documents");
-    assert_eq!(resp.status().as_u16(), 200, "S10: createDocument must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S10: createDocument must be 200"
+    );
     let text = resp.text().await.expect("create body");
     let resp_env = Envelope::from_json(&text).expect("create response envelope");
     let decoded = decode_crud_response(&resp_env).expect("create decodes");
@@ -691,7 +789,10 @@ async fn s14_remaining_crud_roundtrips() {
     let text = resp.text().await.expect("get body");
     let resp_env = Envelope::from_json(&text).expect("get response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("get decodes"), CrudResult::Document(_)),
+        matches!(
+            decode_crud_response(&resp_env).expect("get decodes"),
+            CrudResult::Document(_)
+        ),
         "S14: getDocument must return a Document response envelope"
     );
 
@@ -710,11 +811,18 @@ async fn s14_remaining_crud_roundtrips() {
         .send()
         .await
         .expect("DELETE /documents/:id");
-    assert_eq!(resp.status().as_u16(), 200, "S14: deleteDocument must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S14: deleteDocument must be 200"
+    );
     let text = resp.text().await.expect("delete body");
     let resp_env = Envelope::from_json(&text).expect("delete response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("delete decodes"), CrudResult::DeleteDocument),
+        matches!(
+            decode_crud_response(&resp_env).expect("delete decodes"),
+            CrudResult::DeleteDocument
+        ),
         "S14: deleteDocument must return a void response envelope"
     );
 
@@ -733,7 +841,11 @@ async fn s14_remaining_crud_roundtrips() {
         .send()
         .await
         .expect("POST /documents/:id/publish");
-    assert_eq!(resp.status().as_u16(), 200, "S14: publishDocument must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S14: publishDocument must be 200"
+    );
     let text = resp.text().await.expect("publish body");
     let resp_env = Envelope::from_json(&text).expect("publish response envelope");
     match decode_crud_response(&resp_env).expect("publish decodes") {
@@ -770,7 +882,11 @@ async fn s14_remaining_crud_roundtrips() {
         .send()
         .await
         .expect("POST /documents/:id/unpublish");
-    assert_eq!(resp.status().as_u16(), 200, "S14: unpublishDocument must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S14: unpublishDocument must be 200"
+    );
     let text = resp.text().await.expect("unpublish body");
     let resp_env = Envelope::from_json(&text).expect("unpublish response envelope");
     match decode_crud_response(&resp_env).expect("unpublish decodes") {
@@ -793,7 +909,11 @@ async fn s14_remaining_crud_roundtrips() {
         .send()
         .await
         .expect("POST /documents/:id/archive");
-    assert_eq!(resp.status().as_u16(), 200, "S14: archiveDocument must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S14: archiveDocument must be 200"
+    );
     let text = resp.text().await.expect("archive body");
     let resp_env = Envelope::from_json(&text).expect("archive response envelope");
     match decode_crud_response(&resp_env).expect("archive decodes") {
@@ -821,11 +941,18 @@ async fn s14_remaining_crud_roundtrips() {
         .send()
         .await
         .expect("GET /documents");
-    assert_eq!(resp.status().as_u16(), 200, "S14: listDocuments must be 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "S14: listDocuments must be 200"
+    );
     let text = resp.text().await.expect("list body");
     let resp_env = Envelope::from_json(&text).expect("list response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("list decodes"), CrudResult::DocumentList(_)),
+        matches!(
+            decode_crud_response(&resp_env).expect("list decodes"),
+            CrudResult::DocumentList(_)
+        ),
         "S14: listDocuments must return a DocumentList response envelope"
     );
 
@@ -847,7 +974,10 @@ async fn s14_remaining_crud_roundtrips() {
     let text = resp.text().await.expect("createWiki body");
     let resp_env = Envelope::from_json(&text).expect("createWiki response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("createWiki decodes"), CrudResult::Wiki(_)),
+        matches!(
+            decode_crud_response(&resp_env).expect("createWiki decodes"),
+            CrudResult::Wiki(_)
+        ),
         "S14: createWiki must return a Wiki response envelope"
     );
 
@@ -869,7 +999,10 @@ async fn s14_remaining_crud_roundtrips() {
     let text = resp.text().await.expect("getWiki body");
     let resp_env = Envelope::from_json(&text).expect("getWiki response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("getWiki decodes"), CrudResult::Wiki(_)),
+        matches!(
+            decode_crud_response(&resp_env).expect("getWiki decodes"),
+            CrudResult::Wiki(_)
+        ),
         "S14: getWiki must return a Wiki response envelope"
     );
 
@@ -885,7 +1018,10 @@ async fn s14_remaining_crud_roundtrips() {
     let text = resp.text().await.expect("listWikis body");
     let resp_env = Envelope::from_json(&text).expect("listWikis response envelope");
     assert!(
-        matches!(decode_crud_response(&resp_env).expect("listWikis decodes"), CrudResult::WikiList(_)),
+        matches!(
+            decode_crud_response(&resp_env).expect("listWikis decodes"),
+            CrudResult::WikiList(_)
+        ),
         "S14: listWikis must return a Vec<Wiki> response envelope"
     );
 }
@@ -898,19 +1034,32 @@ async fn s14_remaining_crud_roundtrips() {
 fn s15_per_endpoint_fail_state_status() {
     // POST /documents: WikiNotFound→404, ValidationError→400.
     assert_eq!(server_status(&StoreError::WikiNotFound).unwrap().0, 404);
-    assert_eq!(server_status(&StoreError::ValidationError("x".to_string())).unwrap().0, 400);
+    assert_eq!(
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
+        400
+    );
     // GET /documents/:id: DocumentNotFound→404.
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
     // POST /documents/:id/update: 404/400/409.
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
-    assert_eq!(server_status(&StoreError::ValidationError("x".to_string())).unwrap().0, 400);
+    assert_eq!(
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
+        400
+    );
     assert_eq!(server_status(&StoreError::ConflictError).unwrap().0, 409);
     // DELETE /documents/:id: 404/409.
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
     assert_eq!(server_status(&StoreError::DocumentInUse).unwrap().0, 409);
     // POST /documents/:id/publish: 404/422.
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
-    assert_eq!(server_status(&StoreError::UnresolvedReference).unwrap().0, 422);
+    assert_eq!(
+        server_status(&StoreError::UnresolvedReference).unwrap().0,
+        422
+    );
     // POST /documents/:id/unpublish: 404/409.
     assert_eq!(server_status(&StoreError::DocumentNotFound).unwrap().0, 404);
     assert_eq!(server_status(&StoreError::InvalidState).unwrap().0, 409);
@@ -919,13 +1068,26 @@ fn s15_per_endpoint_fail_state_status() {
     assert_eq!(server_status(&StoreError::InvalidState).unwrap().0, 409);
     // GET /documents: 404/400.
     assert_eq!(server_status(&StoreError::WikiNotFound).unwrap().0, 404);
-    assert_eq!(server_status(&StoreError::ValidationError("x".to_string())).unwrap().0, 400);
+    assert_eq!(
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
+        400
+    );
     // POST /wikis: 400.
-    assert_eq!(server_status(&StoreError::ValidationError("x".to_string())).unwrap().0, 400);
+    assert_eq!(
+        server_status(&StoreError::ValidationError("x".to_string()))
+            .unwrap()
+            .0,
+        400
+    );
     // GET /wikis/:id: 404.
     assert_eq!(server_status(&StoreError::WikiNotFound).unwrap().0, 404);
     // POST /rag/query: 503/502/502.
-    assert_eq!(server_status(&StoreError::EngineUnavailable).unwrap().0, 503);
+    assert_eq!(
+        server_status(&StoreError::EngineUnavailable).unwrap().0,
+        503
+    );
     assert_eq!(server_status(&StoreError::EngineError).unwrap().0, 502);
     assert_eq!(server_status(&StoreError::TraceUnavailable).unwrap().0, 502);
 }

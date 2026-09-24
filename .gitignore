@@ -16,6 +16,9 @@
 # local caches
 .cache/
 
+# vitest run cache (transient test-results; not source)
+.vite/
+
 # sandbox-local cargo home (used to run the trio when the global ~/.cargo write
 # is blocked by the file sandbox; see docs for how to rebuild)
 .cargo-home/

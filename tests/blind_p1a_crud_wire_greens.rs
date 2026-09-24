@@ -17,10 +17,10 @@ use gnosis::error::code_table;
 use gnosis::wire::crud::{
     decode_crud_request, decode_crud_response, encode_crud_error, encode_crud_request,
     encode_crud_response, validate_crud_result, CrudMethod, CrudRequestArgs, CrudResponseError,
-    CrudResult, CrudValidationFailure, ENGINE_ENDPOINTS, ENDPOINT_ARCHIVE_DOCUMENT,
-    ENDPOINT_CREATE_DOCUMENT, ENDPOINT_CREATE_WIKI, ENDPOINT_DELETE_DOCUMENT,
-    ENDPOINT_GET_DOCUMENT, ENDPOINT_GET_WIKI, ENDPOINT_LIST_DOCUMENTS, ENDPOINT_LIST_WIKIS,
-    ENDPOINT_PUBLISH_DOCUMENT, ENDPOINT_UNPUBLISH_DOCUMENT, ENDPOINT_UPDATE_DOCUMENT,
+    CrudResult, CrudValidationFailure, ENDPOINT_ARCHIVE_DOCUMENT, ENDPOINT_CREATE_DOCUMENT,
+    ENDPOINT_CREATE_WIKI, ENDPOINT_DELETE_DOCUMENT, ENDPOINT_GET_DOCUMENT, ENDPOINT_GET_WIKI,
+    ENDPOINT_LIST_DOCUMENTS, ENDPOINT_LIST_WIKIS, ENDPOINT_PUBLISH_DOCUMENT,
+    ENDPOINT_UNPUBLISH_DOCUMENT, ENDPOINT_UPDATE_DOCUMENT, ENGINE_ENDPOINTS,
 };
 use gnosis::wire::decode::DecodeError;
 use gnosis::{
@@ -229,9 +229,15 @@ fn result_for(m: &CrudMethod) -> CrudResult {
 #[test]
 fn s1_request_envelope_all_11_methods() {
     for m in all_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
-        assert_eq!(env.schema_version, CURRENT_SCHEMA_VERSION, "schema_version for {m:?}");
-        assert_eq!(env.id_format, ID_FORMAT_OPAQUE_STRING_V1, "id_format for {m:?}");
+        let env = encode_crud_request(m, args_for(&m));
+        assert_eq!(
+            env.schema_version, CURRENT_SCHEMA_VERSION,
+            "schema_version for {m:?}"
+        );
+        assert_eq!(
+            env.id_format, ID_FORMAT_OPAQUE_STRING_V1,
+            "id_format for {m:?}"
+        );
         let payload = env.payload.as_object().expect("payload must be an object");
         assert_eq!(
             payload.get("method").and_then(|v| v.as_str()),
@@ -249,7 +255,10 @@ fn s1_request_envelope_all_11_methods() {
 #[test]
 fn s2_per_method_args_wire_json() {
     // createDocument
-    let env = encode_crud_request(CrudMethod::CreateDocument, args_for(&CrudMethod::CreateDocument));
+    let env = encode_crud_request(
+        CrudMethod::CreateDocument,
+        args_for(&CrudMethod::CreateDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({
@@ -266,7 +275,10 @@ fn s2_per_method_args_wire_json() {
         "getDocument args"
     );
     // updateDocument
-    let env = encode_crud_request(CrudMethod::UpdateDocument, args_for(&CrudMethod::UpdateDocument));
+    let env = encode_crud_request(
+        CrudMethod::UpdateDocument,
+        args_for(&CrudMethod::UpdateDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({
@@ -277,35 +289,50 @@ fn s2_per_method_args_wire_json() {
         "updateDocument args"
     );
     // deleteDocument
-    let env = encode_crud_request(CrudMethod::DeleteDocument, args_for(&CrudMethod::DeleteDocument));
+    let env = encode_crud_request(
+        CrudMethod::DeleteDocument,
+        args_for(&CrudMethod::DeleteDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({ "caller": "user:alice", "documentId": "d1" })),
         "deleteDocument args"
     );
     // publishDocument
-    let env = encode_crud_request(CrudMethod::PublishDocument, args_for(&CrudMethod::PublishDocument));
+    let env = encode_crud_request(
+        CrudMethod::PublishDocument,
+        args_for(&CrudMethod::PublishDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({ "caller": "user:alice", "documentId": "d1" })),
         "publishDocument args"
     );
     // unpublishDocument
-    let env = encode_crud_request(CrudMethod::UnpublishDocument, args_for(&CrudMethod::UnpublishDocument));
+    let env = encode_crud_request(
+        CrudMethod::UnpublishDocument,
+        args_for(&CrudMethod::UnpublishDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({ "caller": "user:alice", "documentId": "d1" })),
         "unpublishDocument args"
     );
     // archiveDocument
-    let env = encode_crud_request(CrudMethod::ArchiveDocument, args_for(&CrudMethod::ArchiveDocument));
+    let env = encode_crud_request(
+        CrudMethod::ArchiveDocument,
+        args_for(&CrudMethod::ArchiveDocument),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({ "caller": "user:alice", "documentId": "d1" })),
         "archiveDocument args"
     );
     // listDocuments
-    let env = encode_crud_request(CrudMethod::ListDocuments, args_for(&CrudMethod::ListDocuments));
+    let env = encode_crud_request(
+        CrudMethod::ListDocuments,
+        args_for(&CrudMethod::ListDocuments),
+    );
     assert_eq!(
         env.payload.get("args"),
         Some(&serde_json::json!({
@@ -344,7 +371,7 @@ fn s2_per_method_args_wire_json() {
 #[test]
 fn s3_response_envelope_all_11_methods() {
     for m in all_methods() {
-        let env = encode_crud_response(m.clone(), result_for(&m));
+        let env = encode_crud_response(m, result_for(&m));
         let payload = env.payload.as_object().expect("payload must be an object");
         assert_eq!(
             payload.get("method").and_then(|v| v.as_str()),
@@ -383,7 +410,10 @@ fn s4_result_serde_bodies() {
         "Document result body"
     );
     // DocumentList body
-    let env = encode_crud_response(CrudMethod::ListDocuments, result_for(&CrudMethod::ListDocuments));
+    let env = encode_crud_response(
+        CrudMethod::ListDocuments,
+        result_for(&CrudMethod::ListDocuments),
+    );
     let result = env.payload.get("result").expect("result present");
     assert_eq!(result.get("total"), Some(&serde_json::json!(1)));
     assert_eq!(result.get("page"), Some(&serde_json::json!(1)));
@@ -518,10 +548,13 @@ fn s8_endpoint_paths_bijective() {
         assert!(!paths.contains(path), "path {path} duplicated");
         assert!(!methods.contains(m), "method {m:?} duplicated");
         paths.push(path);
-        methods.push(m.clone());
+        methods.push(*m);
     }
     for m in all_methods() {
-        assert!(methods.contains(&m), "method {m:?} missing from ENGINE_ENDPOINTS");
+        assert!(
+            methods.contains(&m),
+            "method {m:?} missing from ENGINE_ENDPOINTS"
+        );
     }
 }
 
@@ -547,20 +580,23 @@ fn s8_endpoint_constants_match_pinned_paths() {
 #[test]
 fn s9_rbac_caller_shape() {
     for m in mutating_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
             .and_then(|v| v.as_object())
             .expect("args object");
-        assert!(args.contains_key("caller"), "mutating {m:?} must carry caller");
+        assert!(
+            args.contains_key("caller"),
+            "mutating {m:?} must carry caller"
+        );
         assert!(
             args.get("caller").and_then(|v| v.as_str()).is_some(),
             "caller must be a string for {m:?}"
         );
     }
     for m in read_only_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -585,8 +621,10 @@ const V12: &str = r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","payload":
 
 #[test]
 fn s10_golden_v10_create_document_request() {
-    let env =
-        encode_crud_request(CrudMethod::CreateDocument, args_for(&CrudMethod::CreateDocument));
+    let env = encode_crud_request(
+        CrudMethod::CreateDocument,
+        args_for(&CrudMethod::CreateDocument),
+    );
     assert_eq!(env.to_json().unwrap(), V10);
 }
 
@@ -671,9 +709,11 @@ fn s13_roundtrip_identity_families() {
     let decoded = decode_crud_response(&encode_crud_response(ListWikis, wikis.clone())).unwrap();
     assert_eq!(decoded, wikis, "wikilist family");
     // Void family.
-    let decoded =
-        decode_crud_response(&encode_crud_response(DeleteDocument, CrudResult::DeleteDocument))
-            .unwrap();
+    let decoded = decode_crud_response(&encode_crud_response(
+        DeleteDocument,
+        CrudResult::DeleteDocument,
+    ))
+    .unwrap();
     assert_eq!(decoded, CrudResult::DeleteDocument, "void family");
 }
 
@@ -712,10 +752,10 @@ fn s14_golden_v14_request_decode_outcome() {
 fn s15_request_response_roundtrip_all_11() {
     for m in all_methods() {
         let args = args_for(&m);
-        let decoded = decode_crud_request(&encode_crud_request(m.clone(), args.clone())).unwrap();
-        assert_eq!(decoded, (m.clone(), args), "request round-trip {m:?}");
+        let decoded = decode_crud_request(&encode_crud_request(m, args.clone())).unwrap();
+        assert_eq!(decoded, (m, args), "request round-trip {m:?}");
         let r = result_for(&m);
-        let decoded = decode_crud_response(&encode_crud_response(m.clone(), r.clone())).unwrap();
+        let decoded = decode_crud_response(&encode_crud_response(m, r.clone())).unwrap();
         assert_eq!(decoded, r, "response round-trip {m:?}");
     }
 }
@@ -800,7 +840,10 @@ fn s17_validate_crud_result_invariants() {
     // Happy path all 11.
     for m in all_methods() {
         let r = result_for(&m);
-        assert!(validate_crud_result(&m, &r).is_ok(), "validate happy path {m:?}");
+        assert!(
+            validate_crud_result(&m, &r).is_ok(),
+            "validate happy path {m:?}"
+        );
     }
     // UnexpectedRevision.
     let mut d = draft_doc();
@@ -895,11 +938,7 @@ fn s17_validate_crud_result_invariants() {
     });
     assert!(validate_crud_result(&CrudMethod::CreateWiki, &w).is_ok());
     assert!(validate_crud_result(&CrudMethod::GetWiki, &w).is_ok());
-    assert!(validate_crud_result(
-        &CrudMethod::ListWikis,
-        &CrudResult::WikiList(vec![])
-    )
-    .is_ok());
+    assert!(validate_crud_result(&CrudMethod::ListWikis, &CrudResult::WikiList(vec![])).is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -952,19 +991,23 @@ fn s18_cross_cutting_request_decode_states() {
 #[test]
 fn s19_sse_unchanged_and_crud_does_not_touch_sse() {
     use gnosis::wire::sse::SseEventType;
-    let labels: Vec<&str> = [SseEventType::Result, SseEventType::Done, SseEventType::Error]
-        .iter()
-        .map(|t| match t {
-            SseEventType::Result => "result",
-            SseEventType::Done => "done",
-            SseEventType::Error => "error",
-        })
-        .collect();
+    let labels: Vec<&str> = [
+        SseEventType::Result,
+        SseEventType::Done,
+        SseEventType::Error,
+    ]
+    .iter()
+    .map(|t| match t {
+        SseEventType::Result => "result",
+        SseEventType::Done => "done",
+        SseEventType::Error => "error",
+    })
+    .collect();
     assert_eq!(labels, ["result", "done", "error"]);
     for m in all_methods() {
-        let req = encode_crud_request(m.clone(), args_for(&m));
-        let resp = encode_crud_response(m.clone(), result_for(&m));
-        let err = encode_crud_error(m.clone(), &StoreError::DocumentNotFound);
+        let req = encode_crud_request(m, args_for(&m));
+        let resp = encode_crud_response(m, result_for(&m));
+        let err = encode_crud_error(m, &StoreError::DocumentNotFound);
         for env in [&req, &resp, &err] {
             let payload = env.payload.as_object().expect("payload object");
             for key in ["event", "data", "type"] {

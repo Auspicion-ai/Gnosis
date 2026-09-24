@@ -50,11 +50,11 @@ use std::sync::{Arc, Barrier};
 use futures::StreamExt;
 use gnosis::{
     rrf_fuse, BlockedBy, CreateDocumentRequest, DerivedIndexes, Document, DocumentId, Edge,
-    EdgeKind, EmbeddingProvider, EngineState, EngineSubsystems, ExpandMode, FieldType, Graph,
-    GraphTraceStep, HybridTrace, MultiQueryOptions, Node, NodeId, NodeKind, QueryAuditEntry,
-    QueryAuditFilters, QueryMode, RagChunk, RagQueryOptions, RagResult, RagResultItem, RagStore,
-    RagStream, RagTrace, ReferenceState, Source, Store, StoreError, TraceDescriptor,
-    UpdateDocumentRequest, VectorIndex, WikiId,
+    EdgeKind, EmbeddingProvider, EngineState, ExpandMode, FieldType, Graph, GraphTraceStep,
+    HybridTrace, MultiQueryOptions, Node, NodeId, NodeKind, QueryAuditEntry, QueryAuditFilters,
+    QueryMode, RagChunk, RagQueryOptions, RagResult, RagResultItem, RagStore, RagStream, RagTrace,
+    ReferenceState, Source, Store, StoreError, TraceDescriptor, UpdateDocumentRequest, VectorIndex,
+    WikiId,
 };
 
 // ---------------------------------------------------------------------------
@@ -1642,44 +1642,85 @@ async fn rag_stream_emits_error_chunk_then_closes() {
 // ---------------------------------------------------------------------------
 
 /// State: `READY` when all subsystems are up (§4.6.1 engine state).
+///
+/// H2 (adversarial pass): the `set_subsystems` write that used to sit here was
+/// **inert** — after U3 the six flags are a read-time projection derived inside
+/// `get_engine_status` (F16), so the hook's value is never read back and the
+/// assertion could not fail. The write is therefore **deleted** (it had become a
+/// no-op assertion), and this test now asserts the **derived** flags for the
+/// capability state it actually wired: a `Ready` engine with NO index and NO
+/// provider reports `store/graph/lexical == true`, `vector == false`,
+/// `embedding == false`, `reranker == false` (the honest `Ready` vector, §5.8 /
+/// F2 §9.1).
 #[tokio::test]
 async fn get_engine_status_ready_when_all_subsystems_up() {
     let store = Arc::new(Store::new());
     store.set_engine_state(EngineState::Ready);
-    store.set_subsystems(EngineSubsystems {
-        store: true,
-        graph: true,
-        lexical: true,
-        vector: true,
-        embedding: true,
-        reranker: true,
-    });
     let status = store.get_engine_status().await;
     assert_eq!(status.state, EngineState::Ready);
-    assert!(status.subsystems.store && status.subsystems.graph && status.subsystems.lexical);
+    assert!(
+        status.subsystems.store && status.subsystems.graph && status.subsystems.lexical,
+        "the core legs are functional in every reachable state"
+    );
+    assert!(
+        !status.subsystems.vector,
+        "no index is wired ⇒ the derived vector flag must be false (not the hook's value)"
+    );
+    assert!(
+        !status.subsystems.embedding,
+        "no provider is wired ⇒ the derived embedding flag must be false"
+    );
+    assert!(
+        !status.subsystems.reranker,
+        "no reranker exists anywhere in src/ ⇒ false in every reachable state"
+    );
 }
 
 /// State: `DEGRADED` when a non-core subsystem (the embedding provider) is down;
 /// core store/graph/lexical still work (§4.6.1).
+///
+/// H2 (adversarial pass): the previous form wrote an inert
+/// `set_subsystems({embedding:false})` mask and then asserted
+/// `!status.subsystems.embedding` — which after U3 holds merely because **no
+/// provider is wired**, so it could not detect a regression in the
+/// DEGRADED/`embedding` derivation. This test now wires a genuinely-unavailable
+/// provider (a local test provider whose `is_available()` is `false`) and
+/// asserts the full honest vector for a no-index snapshot: `store/graph/lexical
+/// == true`, `vector == false`, `reranker == false`, **`embedding == true`**
+/// (the flag is the WIRED capability, §5.8 / §9.5.2 `P-IM-8` — a wired-then-
+/// unreachable provider keeps the claim), plus `last_error.is_some()` as the
+/// unreachability signal. The `set_subsystems` write is dropped.
 #[tokio::test]
 async fn get_engine_status_degraded_when_embedding_provider_down() {
     let store = Arc::new(Store::new());
+    // A genuinely-unavailable provider is WIRED (the seam is `Some`) and the
+    // engine state is `Degraded`: the flag reports the wired capability, while
+    // `state`/`last_error` carry the unreachability.
+    store.set_embedding_provider(Arc::new(StubProvider::unreachable()));
     store.set_engine_state(EngineState::Degraded);
-    store.set_subsystems(EngineSubsystems {
-        store: true,
-        graph: true,
-        lexical: true,
-        vector: true,
-        embedding: false, // embedding provider down
-        reranker: true,
-    });
     let status = store.get_engine_status().await;
     assert_eq!(status.state, EngineState::Degraded);
     assert!(
-        !status.subsystems.embedding,
-        "embedding subsystem reported down"
+        status.subsystems.store && status.subsystems.graph && status.subsystems.lexical,
+        "core store/graph/lexical still work while a non-core subsystem is down"
     );
-    assert!(status.subsystems.store && status.subsystems.graph && status.subsystems.lexical);
+    assert!(
+        !status.subsystems.vector,
+        "no index is built for a fresh store ⇒ the derived vector flag is false"
+    );
+    assert!(
+        status.subsystems.embedding,
+        "a provider IS wired (unreachable ≠ unwired) ⇒ the derived embedding flag is true; \
+         the unreachability is reported by state/last_error, not by a false claim"
+    );
+    assert!(
+        !status.subsystems.reranker,
+        "no reranker exists ⇒ the derived reranker flag is false"
+    );
+    assert!(
+        status.last_error.is_some(),
+        "the DEGRADED state must carry its reason in last_error"
+    );
 }
 
 /// State: `UNAVAILABLE` when the engine is not running/reachable — and a

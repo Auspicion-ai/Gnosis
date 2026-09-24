@@ -20,12 +20,12 @@ use gnosis::envelope::{
 };
 use gnosis::error::code_table;
 use gnosis::wire::crud::{
-    encode_crud_error, encode_crud_request, encode_crud_response, decode_crud_request,
-    decode_crud_response, validate_crud_result, CrudMethod, CrudRequestArgs, CrudResponseError,
-    CrudResult, CrudValidationFailure, ENGINE_ENDPOINTS, ENDPOINT_ARCHIVE_DOCUMENT,
-    ENDPOINT_CREATE_DOCUMENT, ENDPOINT_CREATE_WIKI, ENDPOINT_DELETE_DOCUMENT,
-    ENDPOINT_GET_DOCUMENT, ENDPOINT_GET_WIKI, ENDPOINT_LIST_DOCUMENTS, ENDPOINT_LIST_WIKIS,
-    ENDPOINT_PUBLISH_DOCUMENT, ENDPOINT_UNPUBLISH_DOCUMENT, ENDPOINT_UPDATE_DOCUMENT,
+    decode_crud_request, decode_crud_response, encode_crud_error, encode_crud_request,
+    encode_crud_response, validate_crud_result, CrudMethod, CrudRequestArgs, CrudResponseError,
+    CrudResult, CrudValidationFailure, ENDPOINT_ARCHIVE_DOCUMENT, ENDPOINT_CREATE_DOCUMENT,
+    ENDPOINT_CREATE_WIKI, ENDPOINT_DELETE_DOCUMENT, ENDPOINT_GET_DOCUMENT, ENDPOINT_GET_WIKI,
+    ENDPOINT_LIST_DOCUMENTS, ENDPOINT_LIST_WIKIS, ENDPOINT_PUBLISH_DOCUMENT,
+    ENDPOINT_UNPUBLISH_DOCUMENT, ENDPOINT_UPDATE_DOCUMENT, ENGINE_ENDPOINTS,
 };
 use gnosis::wire::decode::DecodeError;
 use gnosis::{
@@ -239,7 +239,7 @@ fn result_for(m: &CrudMethod) -> CrudResult {
 #[test]
 fn request_envelope_shapes_all_11_methods() {
     for m in all_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let payload = env.payload.as_object().expect("payload must be an object");
         assert_eq!(
             payload.get("method").and_then(|v| v.as_str()),
@@ -258,7 +258,7 @@ fn request_envelope_shapes_all_11_methods() {
 #[test]
 fn response_envelope_shapes_all_11_methods() {
     for m in all_methods() {
-        let env = encode_crud_response(m.clone(), result_for(&m));
+        let env = encode_crud_response(m, result_for(&m));
         let payload = env.payload.as_object().expect("payload must be an object");
         assert_eq!(
             payload.get("method").and_then(|v| v.as_str()),
@@ -400,7 +400,7 @@ fn endpoint_paths_are_bijective() {
         assert!(!paths.contains(path), "path {path} duplicated");
         assert!(!methods.contains(m), "method {m:?} duplicated");
         paths.push(path);
-        methods.push(m.clone());
+        methods.push(*m);
     }
     // Every one of the 11 methods appears exactly once.
     for m in all_methods() {
@@ -435,20 +435,23 @@ fn endpoint_constants_match_pinned_paths() {
 #[test]
 fn rbac_caller_shape() {
     for m in mutating_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
             .and_then(|v| v.as_object())
             .expect("args object");
-        assert!(args.contains_key("caller"), "mutating {m:?} must carry caller");
+        assert!(
+            args.contains_key("caller"),
+            "mutating {m:?} must carry caller"
+        );
         assert!(
             args.get("caller").and_then(|v| v.as_str()).is_some(),
             "caller must be a string for {m:?}"
         );
     }
     for m in read_only_methods() {
-        let env = encode_crud_request(m.clone(), args_for(&m));
+        let env = encode_crud_request(m, args_for(&m));
         let args = env
             .payload
             .get("args")
@@ -474,8 +477,10 @@ const V12: &str = r#"{"schemaVersion":1,"idFormat":"opaque-string-v1","payload":
 /// V-10 — `encode_crud_request(CreateDocument, …)` byte-for-byte.
 #[test]
 fn golden_v10_create_document_request() {
-    let env =
-        encode_crud_request(CrudMethod::CreateDocument, args_for(&CrudMethod::CreateDocument));
+    let env = encode_crud_request(
+        CrudMethod::CreateDocument,
+        args_for(&CrudMethod::CreateDocument),
+    );
     assert_eq!(env.to_json().unwrap(), V10);
 }
 
@@ -564,9 +569,11 @@ fn golden_v13_roundtrip_identity_families() {
     assert_eq!(decoded, wikis, "wikilist family");
 
     // Void family: deleteDocument encodes to "result":null and decodes back.
-    let decoded =
-        decode_crud_response(&encode_crud_response(DeleteDocument, CrudResult::DeleteDocument))
-            .unwrap();
+    let decoded = decode_crud_response(&encode_crud_response(
+        DeleteDocument,
+        CrudResult::DeleteDocument,
+    ))
+    .unwrap();
     assert_eq!(decoded, CrudResult::DeleteDocument, "void family");
 }
 
@@ -608,7 +615,7 @@ fn golden_v14_request_decode_outcome() {
 fn encode_decode_request_roundtrip_all_11() {
     for m in all_methods() {
         let args = args_for(&m);
-        let decoded = decode_crud_request(&encode_crud_request(m.clone(), args.clone())).unwrap();
+        let decoded = decode_crud_request(&encode_crud_request(m, args.clone())).unwrap();
         assert_eq!(decoded, (m, args));
     }
 }
@@ -657,7 +664,7 @@ fn decode_request_fail_states() {
 fn decode_response_happy_path() {
     for m in all_methods() {
         let r = result_for(&m);
-        let decoded = decode_crud_response(&encode_crud_response(m.clone(), r.clone())).unwrap();
+        let decoded = decode_crud_response(&encode_crud_response(m, r.clone())).unwrap();
         assert_eq!(decoded, r, "happy path {m:?}");
     }
 }
@@ -738,7 +745,10 @@ fn decode_response_validation_route() {
 fn validate_crud_result_happy_path() {
     for m in all_methods() {
         let r = result_for(&m);
-        assert!(validate_crud_result(&m, &r).is_ok(), "validate happy path {m:?}");
+        assert!(
+            validate_crud_result(&m, &r).is_ok(),
+            "validate happy path {m:?}"
+        );
     }
 }
 
@@ -868,19 +878,17 @@ fn validate_no_invariant_methods() {
     assert!(validate_crud_result(&CrudMethod::CreateWiki, &w).is_ok());
     assert!(validate_crud_result(&CrudMethod::GetWiki, &w).is_ok());
     // listWikis accepts any well-formed Vec<Wiki>.
-    assert!(validate_crud_result(
-        &CrudMethod::ListWikis,
-        &CrudResult::WikiList(vec![])
-    )
-    .is_ok());
+    assert!(validate_crud_result(&CrudMethod::ListWikis, &CrudResult::WikiList(vec![])).is_ok());
 }
 
 /// §10 — `encode_crud_request` embeds the serde-frozen body verbatim under
 /// `body` (snake_case keys preserved).
 #[test]
 fn request_body_embedded_verbatim() {
-    let env =
-        encode_crud_request(CrudMethod::CreateDocument, args_for(&CrudMethod::CreateDocument));
+    let env = encode_crud_request(
+        CrudMethod::CreateDocument,
+        args_for(&CrudMethod::CreateDocument),
+    );
     let body = env
         .payload
         .get("args")
@@ -933,22 +941,26 @@ fn sse_schema_unchanged_and_crud_does_not_touch_sse() {
     use gnosis::wire::sse::SseEventType;
     // The SSE event schema is unchanged: exactly the 3 F2 event types, no CRUD
     // event types. (Exhaustive match — a new variant would fail to compile.)
-    let labels: Vec<&str> = [SseEventType::Result, SseEventType::Done, SseEventType::Error]
-        .iter()
-        .map(|t| match t {
-            SseEventType::Result => "result",
-            SseEventType::Done => "done",
-            SseEventType::Error => "error",
-        })
-        .collect();
+    let labels: Vec<&str> = [
+        SseEventType::Result,
+        SseEventType::Done,
+        SseEventType::Error,
+    ]
+    .iter()
+    .map(|t| match t {
+        SseEventType::Result => "result",
+        SseEventType::Done => "done",
+        SseEventType::Error => "error",
+    })
+    .collect();
     assert_eq!(labels, ["result", "done", "error"]);
 
     // The CRUD codecs never touch sse.rs: no CRUD request/response/error
     // envelope carries SSE framing keys at the top level of its payload.
     for m in all_methods() {
-        let req = encode_crud_request(m.clone(), args_for(&m));
-        let resp = encode_crud_response(m.clone(), result_for(&m));
-        let err = encode_crud_error(m.clone(), &StoreError::DocumentNotFound);
+        let req = encode_crud_request(m, args_for(&m));
+        let resp = encode_crud_response(m, result_for(&m));
+        let err = encode_crud_error(m, &StoreError::DocumentNotFound);
         for env in [&req, &resp, &err] {
             let payload = env.payload.as_object().expect("payload object");
             for key in ["event", "data", "type"] {

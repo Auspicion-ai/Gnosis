@@ -58,7 +58,10 @@
   the HTTP server + status rendering (P2); the shell-side client (A1); the SSE surface for CRUD
   (there is none — CRUD is request/response; the SSE event schema stays retrieval-only); the
   RFC-4122 id adoption (reused unchanged via the `idFormat` seam); the RBAC *enforcement*
-  semantics (the engine is the enforcer; P1a pins only the credential *shape*).
+  semantics (the engine is the enforcer; P1a pins only the credential *shape*). — RECONCILED 2026-09-22
+  (`RBAC-DOC-DRIFT`): the engine pins the credential **SHAPE** + its decode-layer **presence check** only;
+  the authority mapping and the deny are **SHELL**-side — see `GNOSIS-RBAC-EDIT-ENFORCEMENT` /
+  `docs/HANDOFF.md` §8-RBAC. The historical clause stands as written.
 - **Costs-benefits.** **Cost:** one new `src/wire/crud.rs` module + a small re-export surface +
   the CRUD conformance + property test suites. **Benefit:** the 11 CRUD wire shapes are frozen
   byte-exact and shared as the cross-repo conformance fixture, so P2 (server) and A1 (client)
@@ -107,7 +110,9 @@ shape + the §5.x Property register**. The graph/fact/consistency/RAG-companion 
 - HTTP-status **rendering** (the §11 map is reused as reference; P2 renders it).
 - Bind/auth/TLS + loopback enforcement (recorded shell-owned, as in F2).
 - The RBAC **enforcement** semantics (the engine is the enforcer; P1a pins only the credential
-  shape).
+  shape). — RECONCILED 2026-09-22 (`RBAC-DOC-DRIFT`): the engine pins the credential **SHAPE** + its
+  decode-layer **presence check** only; the authority mapping and the deny are **SHELL**-side — see
+  `GNOSIS-RBAC-EDIT-ENFORCEMENT` / `docs/HANDOFF.md` §8-RBAC. The historical clause stands as written.
 - RFC-4122 id adoption (reused unchanged via the `idFormat` seam).
 - Any SSE surface for CRUD (CRUD is request/response; the SSE event schema stays retrieval-only).
 - Zero new runtime dependencies.
@@ -501,7 +506,10 @@ the 11 methods (the §5.x `P-SM-3` row).
 ## 8. RBAC credential shape (H3)
 
 Gnosis accepts a credential on the **mutating** CRUD calls to confirm whether the caller has edit
-access (the engine is the RBAC enforcer). P1a pins the RBAC credential shape on the mutating
+access (the engine is the RBAC enforcer). — RECONCILED 2026-09-22 (`RBAC-DOC-DRIFT`): the engine pins
+the credential **SHAPE** + its decode-layer **presence check** only; the authority mapping and the
+deny are **SHELL**-side — see `GNOSIS-RBAC-EDIT-ENFORCEMENT` / `docs/HANDOFF.md` §8-RBAC. The
+historical clause stands as written. P1a pins the RBAC credential shape on the mutating
 request envelopes: a **`caller` field** (camelCase) on the 7 mutating request `args` objects,
 carrying the caller's edit-authority credential as an **opaque string** (§4.2). This is distinct
 from the transport auth (token/TLS, GUI-only).
@@ -512,7 +520,12 @@ from the transport auth (token/TLS, GUI-only).
   `listWikis`.
 
 The `caller` field is a **string**; its value semantics (which credential grants edit authority)
-are engine-enforced and out of P1a's scope. P1a pins only the **shape** (a `caller` string field on
+are engine-enforced and out of P1a's scope. — RECONCILED 2026-09-22 (`RBAC-DOC-DRIFT`): *"engine-enforced"*
+is the pre-re-scope wording; the engine pins the credential **SHAPE** + its decode-layer **presence
+check** only (a missing `caller` on the 7 mutating methods ⇒ 400, `p1a` §10), and the
+credential's **value semantics live in the SHELL's authority mapping** — the engine holds none and
+never passes `caller` to the store. See `GNOSIS-RBAC-EDIT-ENFORCEMENT` / `docs/HANDOFF.md` §8-RBAC.
+The historical clause stands as written. P1a pins only the **shape** (a `caller` string field on
 the mutating request args, absent on the read-only request args). The §5.x `P-SM-2` row asserts the
 `caller` survives the request round-trip on mutating methods and is absent on read-only methods.
 
@@ -635,7 +648,10 @@ pub enum CrudValidationFailure {
    request-decode outcome table (§6.2).
 2. The shell-side client (A1) — consumes the same paths + shapes.
 3. The graph/fact/consistency/RAG-companion wire shapes (P1b–P1e — deferred follow-ons).
-4. The RBAC **enforcement** semantics (the engine is the enforcer; P1a pins only the credential shape).
+4. The RBAC **enforcement** semantics (the engine is the enforcer; P1a pins only the credential shape) —
+   RECONCILED 2026-09-22 (`RBAC-DOC-DRIFT`): the engine pins the credential **SHAPE** + its
+   decode-layer **presence check** only; the authority mapping and the deny are **SHELL**-side — see
+   `GNOSIS-RBAC-EDIT-ENFORCEMENT` / `docs/HANDOFF.md` §8-RBAC. The historical clause stands as written.
 5. Bind-loopback + auth/TLS policy (recorded shell-owned, as in F2).
 
 ---
